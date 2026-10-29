@@ -38,7 +38,7 @@ func NewHub(log *slog.Logger) *Hub {
 // a peer always receives its welcome before any other frame, and presence
 // events reach the other side in the order the connections changed. Queuing
 // never blocks and close only starts a background handshake, so no network
-// I/O happens under the lock.
+// I/O or logging happens under the lock.
 func (h *Hub) join(p *Peer) bool {
 	h.mu.Lock()
 	if h.closed {
@@ -55,17 +55,24 @@ func (h *Hub) join(p *Peer) bool {
 	other := r.peers[p.role.Peer()]
 
 	present := other != nil
-	p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present})
+	var slow []*Peer
+	if !p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present}) {
+		slow = append(slow, p)
+	}
 	// Only announce a join when the peer did not already see this role
 	// connected; a replacement is invisible to the other side.
 	if other != nil && old == nil {
-		other.sendControl(ControlMessage{Type: MsgPeerJoined, Role: p.role})
+		if !other.sendControl(ControlMessage{Type: MsgPeerJoined, Role: p.role}) {
+			slow = append(slow, other)
+		}
 	}
 	hook := h.afterUnlock
 	h.mu.Unlock()
 	if hook != nil {
 		hook("join", p)
 	}
+
+	logSlow(slow...)
 
 	if old != nil {
 		old.close(StatusReplaced, "replaced by newer connection")
@@ -84,8 +91,9 @@ func (h *Hub) leave(p *Peer) {
 		return
 	}
 	delete(r.peers, p.role)
-	if other := r.peers[p.role.Peer()]; other != nil {
-		other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role})
+	other := r.peers[p.role.Peer()]
+	if other != nil && other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role}) {
+		other = nil // delivered; nothing to log
 	}
 	if len(r.peers) == 0 {
 		delete(h.rooms, p.roomID)
@@ -95,6 +103,8 @@ func (h *Hub) leave(p *Peer) {
 	if hook != nil {
 		hook("leave", p)
 	}
+
+	logSlow(other)
 
 	h.log.Info("peer left", "room", logRoom(p.roomID), "role", p.role)
 }
@@ -109,13 +119,24 @@ func (h *Hub) forward(p *Peer, typ websocket.MessageType, data []byte) {
 	if r, ok := h.rooms[p.roomID]; ok && r.peers[p.role] == p {
 		other = r.peers[p.role.Peer()]
 	}
-	if other != nil {
-		other.enqueue(frame{typ: typ, data: data})
-	}
+	delivered := other != nil && other.enqueue(frame{typ: typ, data: data})
 	h.mu.Unlock()
 
-	if other == nil {
+	switch {
+	case other == nil:
 		h.log.Debug("dropping frame, peer offline", "room", logRoom(p.roomID), "from", p.role, "bytes", len(data))
+	case !delivered:
+		logSlow(other)
+	}
+}
+
+// logSlow records peers that enqueue disconnected for overflowing their send
+// queue. It must be called without h.mu held, since logging may block.
+func logSlow(peers ...*Peer) {
+	for _, p := range peers {
+		if p != nil {
+			p.log.Warn("send queue full, disconnecting slow consumer")
+		}
 	}
 }
 
