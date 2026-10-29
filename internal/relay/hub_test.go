@@ -8,17 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
-const (
-	testRoom   = "test-room-0123456789abcdef"
-	iterations = 200
-)
+const testRoom = "test-room-0123456789abcdef"
 
 func newTestHub() *Hub {
 	return NewHub(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -160,78 +156,90 @@ func dump(frames []frame) string {
 	return strings.Join(parts, " ")
 }
 
-// together runs fns concurrently, releasing them at the same moment.
-func together(fns ...func()) {
-	var start, wg sync.WaitGroup
-	start.Add(1)
-	for _, fn := range fns {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			start.Wait()
-			fn()
-		}()
+// pauseAt makes h stop the given operation on target right after it releases
+// the hub lock, runs during while it is stopped, then lets it finish. This
+// forces the interleaving where another operation completes inside what was
+// the original implementation's window between unlocking and queuing.
+func pauseAt(t *testing.T, h *Hub, op string, target *Peer, run func(), during func()) {
+	t.Helper()
+	paused, resume := make(chan struct{}), make(chan struct{})
+	h.afterUnlock = func(gotOp string, p *Peer) {
+		if gotOp == op && p == target {
+			close(paused)
+			<-resume
+		}
 	}
-	start.Done()
-	wg.Wait()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		run()
+	}()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never reached the pause point", op)
+	}
+	during()
+	close(resume)
+	<-finished
+	h.afterUnlock = nil
 }
 
 func TestSimultaneousJoinsSeeConsistentPresence(t *testing.T) {
-	for i := 0; i < iterations; i++ {
-		h := newTestHub()
-		mac := newPeer(h, testRoom, RoleMac, 8, nil)
-		android := newPeer(h, testRoom, RoleAndroid, 8, nil)
-		together(func() { h.join(mac) }, func() { h.join(android) })
+	h := newTestHub()
+	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+	android := newPeer(h, testRoom, RoleAndroid, 8, nil)
+	// The mac registers first but android's whole join runs before the mac's
+	// join continues, so android's peer_joined must not precede mac's welcome.
+	pauseAt(t, h, "join", mac, func() { h.join(mac) }, func() { h.join(android) })
 
-		if !checkPresence(t, drain(mac), false, true) {
-			t.Fatal("mac does not see android")
-		}
-		if !checkPresence(t, drain(android), false, true) {
-			t.Fatal("android does not see mac")
-		}
+	if !checkPresence(t, drain(mac), false, true) {
+		t.Fatal("mac does not see android")
+	}
+	if !checkPresence(t, drain(android), false, true) {
+		t.Fatal("android does not see mac")
 	}
 }
 
 func TestForwardDoesNotOvertakeWelcome(t *testing.T) {
-	for i := 0; i < iterations; i++ {
-		h := newTestHub()
-		mac := newPeer(h, testRoom, RoleMac, 8, nil)
-		h.join(mac)
-		drain(mac)
-		android := newPeer(h, testRoom, RoleAndroid, 8, nil)
-		together(
-			func() { h.join(android) },
-			func() { h.forward(mac, websocket.MessageBinary, []byte("data")) },
-		)
-		checkPresence(t, drain(android), false, true)
+	h := newTestHub()
+	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+	h.join(mac)
+	drain(mac)
+	android := newPeer(h, testRoom, RoleAndroid, 8, nil)
+	pauseAt(t, h, "join", android, func() { h.join(android) }, func() {
+		h.forward(mac, websocket.MessageBinary, []byte("data"))
+	})
+
+	f := drain(android)
+	checkPresence(t, f, false, true)
+	if len(f) != 2 || string(f[1].data) != "data" {
+		t.Fatalf("android got %s", dump(f))
 	}
 }
 
 func TestLeaveRejoinKeepsOrder(t *testing.T) {
-	pairs := wsPairs(t)
-	for i := 0; i < iterations; i++ {
-		h := newTestHub()
-		mac := newPeer(h, testRoom, RoleMac, 8, nil)
-		srv, _ := pairs()
-		oldAndroid := newPeer(h, testRoom, RoleAndroid, 8, srv)
-		h.join(mac)
-		h.join(oldAndroid)
-		drain(mac)
+	h := newTestHub()
+	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+	oldAndroid := newPeer(h, testRoom, RoleAndroid, 8, nil)
+	h.join(mac)
+	h.join(oldAndroid)
+	drain(mac)
 
-		// The old connection's cleanup races the new connection's join; the
-		// mac must end up seeing android present either way.
-		newAndroid := newPeer(h, testRoom, RoleAndroid, 8, nil)
-		together(func() { h.leave(oldAndroid) }, func() { h.join(newAndroid) })
+	// The old connection's cleanup has unregistered it, and the new
+	// connection joins before that cleanup finishes; the mac must still end
+	// up seeing android present.
+	newAndroid := newPeer(h, testRoom, RoleAndroid, 8, nil)
+	pauseAt(t, h, "leave", oldAndroid, func() { h.leave(oldAndroid) }, func() { h.join(newAndroid) })
 
-		if !checkPresence(t, drain(mac), true, false) {
-			t.Fatal("mac does not see rejoined android")
-		}
-		if !checkPresence(t, drain(newAndroid), false, true) {
-			t.Fatal("new android does not see mac")
-		}
-		if s := h.Stats(); s.Peers != 2 {
-			t.Fatalf("stats = %+v", s)
-		}
+	if !checkPresence(t, drain(mac), true, false) {
+		t.Fatal("mac does not see rejoined android")
+	}
+	if !checkPresence(t, drain(newAndroid), false, true) {
+		t.Fatal("new android does not see mac")
+	}
+	if s := h.Stats(); s.Peers != 2 {
+		t.Fatalf("stats = %+v", s)
 	}
 }
 

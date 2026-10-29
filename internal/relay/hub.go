@@ -14,6 +14,10 @@ type Hub struct {
 	mu     sync.Mutex
 	rooms  map[string]*room
 	closed bool
+
+	// afterUnlock, if set, runs right after join or leave releases mu. Tests
+	// use it to pause an operation there and force a specific interleaving.
+	afterUnlock func(op string, p *Peer)
 }
 
 type room struct {
@@ -57,7 +61,11 @@ func (h *Hub) join(p *Peer) bool {
 	if other != nil && old == nil {
 		other.sendControl(ControlMessage{Type: MsgPeerJoined, Role: p.role})
 	}
+	hook := h.afterUnlock
 	h.mu.Unlock()
+	if hook != nil {
+		hook("join", p)
+	}
 
 	if old != nil {
 		old.close(StatusReplaced, "replaced by newer connection")
@@ -82,7 +90,11 @@ func (h *Hub) leave(p *Peer) {
 	if len(r.peers) == 0 {
 		delete(h.rooms, p.roomID)
 	}
+	hook := h.afterUnlock
 	h.mu.Unlock()
+	if hook != nil {
+		hook("leave", p)
+	}
 
 	h.log.Info("peer left", "room", logRoom(p.roomID), "role", p.role)
 }
