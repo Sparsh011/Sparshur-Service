@@ -136,7 +136,8 @@ func (p *Peer) pingLoop() {
 
 // enqueue queues a frame for delivery without blocking the sender. A peer
 // whose queue is full is disconnected rather than allowed to stall its
-// counterpart.
+// counterpart. The hub calls it while holding its lock to keep delivery
+// ordered, so it must never block or perform network I/O itself.
 func (p *Peer) enqueue(f frame) {
 	select {
 	case <-p.done:

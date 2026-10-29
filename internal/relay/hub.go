@@ -28,6 +28,13 @@ func NewHub(log *slog.Logger) *Hub {
 // join registers p in its room, replacing any existing peer with the same
 // role, and notifies both sides about presence. It returns false if the hub
 // is shutting down.
+//
+// Control messages are queued while h.mu is held so that every membership
+// change and the notifications it causes are observed in one global order:
+// a peer always receives its welcome before any other frame, and presence
+// events reach the other side in the order the connections changed. Queuing
+// never blocks and close only starts a background handshake, so no network
+// I/O happens under the lock.
 func (h *Hub) join(p *Peer) bool {
 	h.mu.Lock()
 	if h.closed {
@@ -42,11 +49,6 @@ func (h *Hub) join(p *Peer) bool {
 	old := r.peers[p.role]
 	r.peers[p.role] = p
 	other := r.peers[p.role.Peer()]
-	h.mu.Unlock()
-
-	if old != nil {
-		old.close(StatusReplaced, "replaced by newer connection")
-	}
 
 	present := other != nil
 	p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present})
@@ -54,6 +56,11 @@ func (h *Hub) join(p *Peer) bool {
 	// connected; a replacement is invisible to the other side.
 	if other != nil && old == nil {
 		other.sendControl(ControlMessage{Type: MsgPeerJoined, Role: p.role})
+	}
+	h.mu.Unlock()
+
+	if old != nil {
+		old.close(StatusReplaced, "replaced by newer connection")
 	}
 	h.log.Info("peer joined", "room", logRoom(p.roomID), "role", p.role, "peer_present", present, "replaced", old != nil)
 	return true
@@ -69,34 +76,35 @@ func (h *Hub) leave(p *Peer) {
 		return
 	}
 	delete(r.peers, p.role)
-	other := r.peers[p.role.Peer()]
+	if other := r.peers[p.role.Peer()]; other != nil {
+		other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role})
+	}
 	if len(r.peers) == 0 {
 		delete(h.rooms, p.roomID)
 	}
 	h.mu.Unlock()
 
-	if other != nil {
-		other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role})
-	}
 	h.log.Info("peer left", "room", logRoom(p.roomID), "role", p.role)
 }
 
 // forward delivers a frame from p to its counterpart. Frames sent while the
 // counterpart is offline are dropped; clients learn presence from control
-// messages and are expected to resend.
+// messages and are expected to resend. The frame is queued under h.mu so it
+// cannot overtake the presence messages that precede it.
 func (h *Hub) forward(p *Peer, typ websocket.MessageType, data []byte) {
 	h.mu.Lock()
 	var other *Peer
 	if r, ok := h.rooms[p.roomID]; ok && r.peers[p.role] == p {
 		other = r.peers[p.role.Peer()]
 	}
+	if other != nil {
+		other.enqueue(frame{typ: typ, data: data})
+	}
 	h.mu.Unlock()
 
 	if other == nil {
 		h.log.Debug("dropping frame, peer offline", "room", logRoom(p.roomID), "from", p.role, "bytes", len(data))
-		return
 	}
-	other.enqueue(frame{typ: typ, data: data})
 }
 
 // Stats is a snapshot of hub occupancy.
