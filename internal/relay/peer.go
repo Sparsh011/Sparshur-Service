@@ -136,24 +136,25 @@ func (p *Peer) pingLoop() {
 
 // enqueue queues a frame for delivery without blocking the sender. A peer
 // whose queue is full is disconnected rather than allowed to stall its
-// counterpart.
-func (p *Peer) enqueue(f frame) {
+// counterpart, and enqueue reports false so the caller can log it. The hub
+// calls it while holding its lock to keep delivery ordered, so it must never
+// block, log, or perform network I/O itself.
+func (p *Peer) enqueue(f frame) bool {
 	select {
 	case <-p.done:
 	case p.send <- f:
 	default:
-		p.log.Warn("send queue full, disconnecting slow consumer")
 		p.close(StatusSlowConsumer, "send queue overflow")
+		return false
 	}
+	return true
 }
 
-func (p *Peer) sendControl(m ControlMessage) {
-	b, err := json.Marshal(m)
-	if err != nil {
-		p.log.Error("marshal control message", "err", err)
-		return
-	}
-	p.enqueue(frame{typ: websocket.MessageText, data: b})
+// sendControl queues a control message; see enqueue for the result.
+func (p *Peer) sendControl(m ControlMessage) bool {
+	// ControlMessage holds only strings and a bool, so Marshal cannot fail.
+	b, _ := json.Marshal(m)
+	return p.enqueue(frame{typ: websocket.MessageText, data: b})
 }
 
 // close starts shutting the peer down. It is safe to call many times and
