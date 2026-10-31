@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -62,11 +63,21 @@ func run() error {
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	// Shutdown stops new connections; hub.Close tells hijacked WebSocket
-	// connections to go away, which Shutdown does not do on its own.
-	hub.Close()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	// srv.Shutdown closes the listener and drains plain HTTP requests, but
+	// neither closes nor waits for hijacked WebSocket connections; the hub
+	// drains those in parallel under the same deadline.
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.Shutdown(shutdownCtx) }()
+	hubErr := hub.Shutdown(shutdownCtx)
+	if hubErr != nil {
+		hubErr = fmt.Errorf("drain websocket sessions: %w", hubErr)
 	}
-	return nil
+	err = <-srvErr
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		_ = srv.Close()
+		err = fmt.Errorf("shut down http server: %w", err)
+	} else {
+		err = nil
+	}
+	return errors.Join(hubErr, err)
 }

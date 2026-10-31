@@ -14,21 +14,24 @@ type Config struct {
 	// Addr is the TCP address the HTTP server listens on.
 	Addr string
 
-	// MaxMessageBytes caps the size of a single relayed frame.
+	// MaxMessageBytes caps the size of a single relayed WebSocket message
+	// (a fragmented message counts as a whole, not per frame).
 	MaxMessageBytes int64
 
-	// SendQueueSize is the number of frames buffered per connection before
+	// SendQueueSize is the number of messages buffered per connection before
 	// the connection is treated as a slow consumer and dropped.
 	SendQueueSize int
 
 	// PingInterval is how often the relay pings each client to keep NATs and
 	// proxies from timing out idle connections and to detect dead peers.
+	// Zero disables pings.
 	PingInterval time.Duration
 
-	// WriteTimeout bounds a single write (frame or ping) to a client.
+	// WriteTimeout bounds a single write (message or ping) to a client.
 	WriteTimeout time.Duration
 
-	// ShutdownTimeout is how long in-flight connections get on SIGTERM.
+	// ShutdownTimeout is how long connections get to close on SIGTERM before
+	// they are force-closed.
 	ShutdownTimeout time.Duration
 
 	// AllowedOrigins lists Origin host patterns accepted on WebSocket upgrade.
@@ -53,10 +56,11 @@ func Load() (Config, error) {
 	}
 
 	var err error
-	if cfg.MaxMessageBytes, err = intEnv("RELAY_MAX_MESSAGE_BYTES", cfg.MaxMessageBytes); err != nil {
+	if cfg.MaxMessageBytes, err = intEnv("RELAY_MAX_MESSAGE_BYTES", cfg.MaxMessageBytes, 64); err != nil {
 		return Config{}, err
 	}
-	queue, err := intEnv("RELAY_SEND_QUEUE_SIZE", int64(cfg.SendQueueSize))
+	// Parse at the platform int size so the conversion below cannot overflow.
+	queue, err := intEnv("RELAY_SEND_QUEUE_SIZE", int64(cfg.SendQueueSize), strconv.IntSize)
 	if err != nil {
 		return Config{}, err
 	}
@@ -84,6 +88,15 @@ func Load() (Config, error) {
 	if cfg.SendQueueSize <= 0 {
 		return Config{}, fmt.Errorf("RELAY_SEND_QUEUE_SIZE must be positive")
 	}
+	if cfg.PingInterval < 0 {
+		return Config{}, fmt.Errorf("RELAY_PING_INTERVAL must not be negative (0 disables pings)")
+	}
+	if cfg.WriteTimeout <= 0 {
+		return Config{}, fmt.Errorf("RELAY_WRITE_TIMEOUT must be positive")
+	}
+	if cfg.ShutdownTimeout <= 0 {
+		return Config{}, fmt.Errorf("RELAY_SHUTDOWN_TIMEOUT must be positive")
+	}
 	return cfg, nil
 }
 
@@ -94,12 +107,12 @@ func getenv(key, def string) string {
 	return def
 }
 
-func intEnv(key string, def int64) (int64, error) {
+func intEnv(key string, def int64, bitSize int) (int64, error) {
 	v := os.Getenv(key)
 	if v == "" {
 		return def, nil
 	}
-	n, err := strconv.ParseInt(v, 10, 64)
+	n, err := strconv.ParseInt(v, 10, bitSize)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}

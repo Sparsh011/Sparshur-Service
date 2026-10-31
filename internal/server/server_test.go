@@ -20,7 +20,7 @@ import (
 
 const testRoom = "test-room-0123456789abcdef"
 
-func newTestServer(t *testing.T) *httptest.Server {
+func newTestServer(t *testing.T, opts ...func(*config.Config)) (*httptest.Server, *relay.Hub) {
 	t.Helper()
 	cfg := config.Config{
 		MaxMessageBytes: 1 << 16,
@@ -28,22 +28,30 @@ func newTestServer(t *testing.T) *httptest.Server {
 		PingInterval:    time.Second,
 		WriteTimeout:    time.Second,
 	}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	hub := relay.NewHub(log)
 	ts := httptest.NewServer(New(cfg, hub, log).Handler())
 	t.Cleanup(func() {
-		hub.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = hub.Shutdown(ctx)
 		ts.Close()
 	})
-	return ts
+	return ts, hub
+}
+
+func wsURL(ts *httptest.Server, room string, role relay.Role) string {
+	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/rooms/" + room + "/ws?role=" + string(role)
 }
 
 func dial(t *testing.T, ts *httptest.Server, room string, role relay.Role) *websocket.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/rooms/" + room + "/ws?role=" + string(role)
-	c, _, err := websocket.Dial(ctx, url, nil)
+	c, _, err := websocket.Dial(ctx, wsURL(ts, room, role), nil)
 	if err != nil {
 		t.Fatalf("dial %s: %v", role, err)
 	}
@@ -118,7 +126,7 @@ func pair(t *testing.T, ts *httptest.Server) (mac, android *websocket.Conn) {
 }
 
 func TestRelayForwardsBinaryBothWays(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	mac, android := pair(t, ts)
 
 	toAndroid := []byte{0x00, 0x01, 0xfe, 0xff}
@@ -135,7 +143,7 @@ func TestRelayForwardsBinaryBothWays(t *testing.T) {
 }
 
 func TestPeerLeftNotification(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	mac, android := pair(t, ts)
 
 	android.Close(websocket.StatusNormalClosure, "")
@@ -145,7 +153,7 @@ func TestPeerLeftNotification(t *testing.T) {
 }
 
 func TestTextFramesRejected(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	mac, _ := pair(t, ts)
 
 	write(t, mac, websocket.MessageText, []byte("hello"))
@@ -153,7 +161,7 @@ func TestTextFramesRejected(t *testing.T) {
 }
 
 func TestReconnectReplacesOldConnection(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	oldMac, android := pair(t, ts)
 
 	newMac := dial(t, ts, testRoom, relay.RoleMac)
@@ -170,7 +178,7 @@ func TestReconnectReplacesOldConnection(t *testing.T) {
 }
 
 func TestRoomsAreIsolated(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	mac, _ := pair(t, ts)
 
 	other := dial(t, ts, "another-room-0123456789abc", relay.RoleAndroid)
@@ -187,7 +195,7 @@ func TestRoomsAreIsolated(t *testing.T) {
 }
 
 func TestBadRequests(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	cases := map[string]string{
 		"missing role": "/v1/rooms/" + testRoom + "/ws",
 		"bad role":     "/v1/rooms/" + testRoom + "/ws?role=ios",
@@ -208,7 +216,7 @@ func TestBadRequests(t *testing.T) {
 }
 
 func TestCreateRoom(t *testing.T) {
-	ts := newTestServer(t)
+	ts, _ := newTestServer(t)
 	resp, err := http.Post(ts.URL+"/v1/rooms", "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -225,5 +233,141 @@ func TestCreateRoom(t *testing.T) {
 	}
 	if !relay.ValidRoomID(body.RoomID) {
 		t.Fatalf("invalid room id %q", body.RoomID)
+	}
+}
+
+func TestOversizedMessageClosesSender(t *testing.T) {
+	ts, _ := newTestServer(t)
+	mac, android := pair(t, ts)
+	android.SetReadLimit(1 << 17) // the client library defaults to 32 KiB
+
+	// The limit applies to whole WebSocket messages; exactly the limit passes.
+	limit := make([]byte, 1<<16)
+	write(t, mac, websocket.MessageBinary, limit)
+	if _, got := read(t, android); len(got) != len(limit) {
+		t.Fatalf("android got %d bytes", len(got))
+	}
+
+	write(t, mac, websocket.MessageBinary, make([]byte, 1<<16+1))
+	expectClose(t, mac, websocket.StatusMessageTooBig)
+	if m := readControl(t, android); m.Type != relay.MsgPeerLeft {
+		t.Fatalf("android got %+v", m)
+	}
+}
+
+func TestMessagesDroppedWhilePeerOffline(t *testing.T) {
+	ts, _ := newTestServer(t)
+	mac := dial(t, ts, testRoom, relay.RoleMac)
+	readControl(t, mac)
+	write(t, mac, websocket.MessageBinary, []byte("nobody home"))
+
+	android := dial(t, ts, testRoom, relay.RoleAndroid)
+	if m := readControl(t, android); m.Type != relay.MsgWelcome || !*m.PeerPresent {
+		t.Fatalf("android welcome = %+v", m)
+	}
+	readControl(t, mac) // peer_joined
+	write(t, mac, websocket.MessageBinary, []byte("now"))
+	if _, got := read(t, android); string(got) != "now" {
+		t.Fatalf("android got %q; offline message was not dropped", got)
+	}
+}
+
+func TestReconnectAfterLeaveNotifiesInOrder(t *testing.T) {
+	ts, _ := newTestServer(t)
+	mac, android := pair(t, ts)
+
+	android.Close(websocket.StatusNormalClosure, "")
+	if m := readControl(t, mac); m.Type != relay.MsgPeerLeft || m.Role != relay.RoleAndroid {
+		t.Fatalf("mac got %+v", m)
+	}
+	android = dial(t, ts, testRoom, relay.RoleAndroid)
+	if m := readControl(t, android); m.Type != relay.MsgWelcome || !*m.PeerPresent {
+		t.Fatalf("android welcome = %+v", m)
+	}
+	if m := readControl(t, mac); m.Type != relay.MsgPeerJoined || m.Role != relay.RoleAndroid {
+		t.Fatalf("mac got %+v", m)
+	}
+}
+
+func TestOriginPolicy(t *testing.T) {
+	ts, _ := newTestServer(t, func(c *config.Config) { c.AllowedOrigins = []string{"app.example"} })
+	cases := map[string]struct {
+		origin string
+		ok     bool
+	}{
+		"native client": {"", true},
+		"allowed":       {"https://app.example", true},
+		"disallowed":    {"https://evil.example", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			h := http.Header{}
+			if tc.origin != "" {
+				h.Set("Origin", tc.origin)
+			}
+			c, resp, err := websocket.Dial(ctx, wsURL(ts, testRoom, relay.RoleMac), &websocket.DialOptions{HTTPHeader: h})
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("dial: %v", err)
+				}
+				c.Close(websocket.StatusNormalClosure, "")
+				return
+			}
+			if err == nil {
+				c.CloseNow()
+				t.Fatal("dial succeeded")
+			}
+			if resp == nil || resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("resp = %v, err = %v", resp, err)
+			}
+		})
+	}
+}
+
+func getJSON(t *testing.T, url string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, body
+}
+
+func TestHealthAndReadiness(t *testing.T) {
+	ts, hub := newTestServer(t)
+	if code, body := getJSON(t, ts.URL+"/healthz"); code != http.StatusOK || body["status"] != "ok" {
+		t.Fatalf("healthz = %d %v", code, body)
+	}
+
+	mac, android := pair(t, ts)
+	code, body := getJSON(t, ts.URL+"/readyz")
+	stats, _ := body["stats"].(map[string]any)
+	if code != http.StatusOK || body["status"] != "ok" || stats["rooms"] != 1.0 || stats["peers"] != 2.0 {
+		t.Fatalf("readyz = %d %v", code, body)
+	}
+
+	mac.CloseNow()
+	android.CloseNow()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := hub.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if code, body := getJSON(t, ts.URL+"/readyz"); code != http.StatusServiceUnavailable || body["status"] != "draining" {
+		t.Fatalf("readyz while draining = %d %v", code, body)
+	}
+	if code, _ := getJSON(t, ts.URL+"/healthz"); code != http.StatusOK {
+		t.Fatalf("healthz while draining = %d", code)
+	}
+	_, resp, err := websocket.Dial(ctx, wsURL(ts, testRoom, relay.RoleMac), nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("dial while draining: resp = %v, err = %v", resp, err)
 	}
 }

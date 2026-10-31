@@ -1,19 +1,36 @@
 package relay
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 
 	"github.com/coder/websocket"
 )
 
-// Hub tracks rooms and routes frames between the two peers of a room.
+// Hub tracks rooms and routes messages between the two peers of a room.
 type Hub struct {
 	log *slog.Logger
 
-	mu     sync.Mutex
-	rooms  map[string]*room
-	closed bool
+	// mu serializes membership changes together with queueing the control
+	// messages and frames that depend on them, so every peer observes
+	// presence changes and forwarded messages in one consistent order. Only
+	// nonblocking work (map updates, channel sends with a default case,
+	// Peer.close) happens while it is held; network I/O happens in each
+	// peer's own goroutines.
+	mu    sync.Mutex
+	rooms map[string]*room
+	// sessions holds every connection that joined and whose Serve has not
+	// returned yet, including connections that were replaced and are still
+	// finishing their close handshake.
+	sessions map[*Peer]struct{}
+	draining bool
+	active   sync.WaitGroup
+
+	// testHookUnlocked, if set, runs right after join or leave releases mu.
+	// Tests use it to interleave another operation at the point where the
+	// messages queued by the first must already be in order.
+	testHookUnlocked func()
 }
 
 type room struct {
@@ -22,15 +39,19 @@ type room struct {
 
 // NewHub creates an empty hub.
 func NewHub(log *slog.Logger) *Hub {
-	return &Hub{log: log, rooms: make(map[string]*room)}
+	return &Hub{
+		log:      log,
+		rooms:    make(map[string]*room),
+		sessions: make(map[*Peer]struct{}),
+	}
 }
 
 // join registers p in its room, replacing any existing peer with the same
 // role, and notifies both sides about presence. It returns false if the hub
-// is shutting down.
+// is draining.
 func (h *Hub) join(p *Peer) bool {
 	h.mu.Lock()
-	if h.closed {
+	if h.draining {
 		h.mu.Unlock()
 		return false
 	}
@@ -40,21 +61,29 @@ func (h *Hub) join(p *Peer) bool {
 		h.rooms[p.roomID] = r
 	}
 	old := r.peers[p.role]
-	r.peers[p.role] = p
 	other := r.peers[p.role.Peer()]
-	h.mu.Unlock()
+	present := other != nil
+
+	// Queue the welcome before p becomes visible to forward, so it is always
+	// the first message p receives.
+	p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present})
+	r.peers[p.role] = p
+	h.sessions[p] = struct{}{}
+	h.active.Add(1)
 
 	if old != nil {
 		old.close(StatusReplaced, "replaced by newer connection")
 	}
-
-	present := other != nil
-	p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present})
 	// Only announce a join when the peer did not already see this role
 	// connected; a replacement is invisible to the other side.
 	if other != nil && old == nil {
 		other.sendControl(ControlMessage{Type: MsgPeerJoined, Role: p.role})
 	}
+	h.mu.Unlock()
+	if h.testHookUnlocked != nil {
+		h.testHookUnlocked()
+	}
+
 	h.log.Info("peer joined", "room", logRoom(p.roomID), "role", p.role, "peer_present", present, "replaced", old != nil)
 	return true
 }
@@ -69,34 +98,46 @@ func (h *Hub) leave(p *Peer) {
 		return
 	}
 	delete(r.peers, p.role)
-	other := r.peers[p.role.Peer()]
+	if other := r.peers[p.role.Peer()]; other != nil {
+		other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role})
+	}
 	if len(r.peers) == 0 {
 		delete(h.rooms, p.roomID)
 	}
 	h.mu.Unlock()
-
-	if other != nil {
-		other.sendControl(ControlMessage{Type: MsgPeerLeft, Role: p.role})
+	if h.testHookUnlocked != nil {
+		h.testHookUnlocked()
 	}
+
 	h.log.Info("peer left", "room", logRoom(p.roomID), "role", p.role)
 }
 
-// forward delivers a frame from p to its counterpart. Frames sent while the
-// counterpart is offline are dropped; clients learn presence from control
-// messages and are expected to resend.
+// release forgets a session once its connection has fully closed.
+func (h *Hub) release(p *Peer) {
+	h.mu.Lock()
+	delete(h.sessions, p)
+	h.mu.Unlock()
+	h.active.Done()
+}
+
+// forward delivers a message from p to its counterpart. Messages sent while
+// the counterpart is offline, or by a connection that has been replaced, are
+// dropped; clients learn presence from control messages and are expected to
+// resend.
 func (h *Hub) forward(p *Peer, typ websocket.MessageType, data []byte) {
 	h.mu.Lock()
 	var other *Peer
 	if r, ok := h.rooms[p.roomID]; ok && r.peers[p.role] == p {
 		other = r.peers[p.role.Peer()]
 	}
+	if other != nil {
+		other.enqueue(frame{typ: typ, data: data})
+	}
 	h.mu.Unlock()
 
 	if other == nil {
-		h.log.Debug("dropping frame, peer offline", "room", logRoom(p.roomID), "from", p.role, "bytes", len(data))
-		return
+		h.log.Debug("dropping message, peer offline", "room", logRoom(p.roomID), "from", p.role, "bytes", len(data))
 	}
-	other.enqueue(frame{typ: typ, data: data})
 }
 
 // Stats is a snapshot of hub occupancy.
@@ -116,22 +157,55 @@ func (h *Hub) Stats() Stats {
 	return s
 }
 
-// Close disconnects every peer and refuses new ones. It is used on shutdown,
-// because http.Server.Shutdown does not close hijacked connections.
-func (h *Hub) Close() {
+// Draining reports whether Shutdown has been called.
+func (h *Hub) Draining() bool {
 	h.mu.Lock()
-	h.closed = true
-	var peers []*Peer
-	for _, r := range h.rooms {
-		for _, p := range r.peers {
-			peers = append(peers, p)
-		}
-	}
+	defer h.mu.Unlock()
+	return h.draining
+}
+
+// Shutdown stops admitting new sessions, asks every active session to close
+// with StatusGoingAway, and waits for them to finish. If ctx ends first, the
+// remaining sessions are force-closed and ctx's error is returned without
+// waiting further. It is needed because http.Server.Shutdown neither closes
+// nor waits for hijacked connections.
+func (h *Hub) Shutdown(ctx context.Context) error {
+	h.mu.Lock()
+	h.draining = true
+	peers := h.sessionList()
 	h.mu.Unlock()
 
 	for _, p := range peers {
 		p.close(websocket.StatusGoingAway, "relay shutting down")
 	}
+
+	done := make(chan struct{})
+	go func() {
+		h.active.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+	}
+
+	h.mu.Lock()
+	peers = h.sessionList()
+	h.mu.Unlock()
+	h.log.Warn("shutdown deadline exceeded, force-closing connections", "remaining", len(peers))
+	for _, p := range peers {
+		p.forceClose()
+	}
+	return ctx.Err()
+}
+
+func (h *Hub) sessionList() []*Peer {
+	peers := make([]*Peer, 0, len(h.sessions))
+	for p := range h.sessions {
+		peers = append(peers, p)
+	}
+	return peers
 }
 
 // logRoom shortens a room ID for logs so full capabilities are not written

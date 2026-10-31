@@ -13,10 +13,16 @@ import (
 
 // Options tunes per-connection behaviour.
 type Options struct {
+	// MaxMessageBytes caps one WebSocket message (after reassembly of
+	// fragmented frames). Larger messages close the connection with 1009.
 	MaxMessageBytes int64
-	SendQueueSize   int
-	PingInterval    time.Duration
-	WriteTimeout    time.Duration
+	// SendQueueSize is the number of outbound messages buffered per
+	// connection; it must be at least 1 so the welcome message fits.
+	SendQueueSize int
+	// PingInterval is the keepalive period; zero disables pings.
+	PingInterval time.Duration
+	// WriteTimeout bounds each write and ping; it must be positive.
+	WriteTimeout time.Duration
 }
 
 type frame struct {
@@ -43,22 +49,10 @@ type Peer struct {
 }
 
 // Serve runs a relay session for an accepted WebSocket connection and blocks
-// until the connection ends.
+// until the connection ends. Sessions started while the hub is draining are
+// closed immediately with StatusGoingAway.
 func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn, roomID string, role Role, opts Options) {
-	ctx, cancel := context.WithCancel(ctx)
-	p := &Peer{
-		hub:    h,
-		conn:   conn,
-		roomID: roomID,
-		role:   role,
-		opts:   opts,
-		log:    h.log.With("room", logRoom(roomID), "role", role),
-		ctx:    ctx,
-		cancel: cancel,
-		send:   make(chan frame, opts.SendQueueSize),
-		done:   make(chan struct{}),
-		closed: make(chan struct{}),
-	}
+	p := newPeer(ctx, h, conn, roomID, role, opts)
 	conn.SetReadLimit(opts.MaxMessageBytes)
 
 	go p.writeLoop()
@@ -71,9 +65,27 @@ func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn, roomID string, ro
 		<-p.closed
 		return
 	}
+	defer h.release(p)
 	p.readLoop()
 	h.leave(p)
 	<-p.closed
+}
+
+func newPeer(ctx context.Context, h *Hub, conn *websocket.Conn, roomID string, role Role, opts Options) *Peer {
+	ctx, cancel := context.WithCancel(ctx)
+	return &Peer{
+		hub:    h,
+		conn:   conn,
+		roomID: roomID,
+		role:   role,
+		opts:   opts,
+		log:    h.log.With("room", logRoom(roomID), "role", role),
+		ctx:    ctx,
+		cancel: cancel,
+		send:   make(chan frame, opts.SendQueueSize),
+		done:   make(chan struct{}),
+		closed: make(chan struct{}),
+	}
 }
 
 func (p *Peer) readLoop() {
@@ -136,7 +148,7 @@ func (p *Peer) pingLoop() {
 
 // enqueue queues a frame for delivery without blocking the sender. A peer
 // whose queue is full is disconnected rather than allowed to stall its
-// counterpart.
+// counterpart. It never blocks, so the hub calls it with its lock held.
 func (p *Peer) enqueue(f frame) {
 	select {
 	case <-p.done:
@@ -158,6 +170,7 @@ func (p *Peer) sendControl(m ControlMessage) {
 
 // close starts shutting the peer down. It is safe to call many times and
 // from any goroutine; only the first call's status is sent to the client.
+// It never blocks, so the hub calls it with its lock held.
 func (p *Peer) close(code websocket.StatusCode, reason string) {
 	p.closeOnce.Do(func() {
 		close(p.done)
@@ -169,4 +182,13 @@ func (p *Peer) close(code websocket.StatusCode, reason string) {
 			close(p.closed)
 		}()
 	})
+}
+
+// forceClose abandons a close handshake that has not finished in time.
+// Cancelling the session context aborts any in-flight read, write, or ping,
+// which makes the WebSocket library drop the TCP connection. Close itself
+// cannot be interrupted, so a handshake started after the read loop exited
+// is still bounded only by the library's own timeouts.
+func (p *Peer) forceClose() {
+	p.cancel()
 }

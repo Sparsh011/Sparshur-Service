@@ -1,12 +1,12 @@
 // Package relay implements a blind WebSocket relay between two paired devices.
 //
-// Each room holds at most one "mac" peer and one "android" peer. Binary frames
+// Each room holds at most one "mac" peer and one "android" peer. Binary messages
 // sent by one peer are forwarded verbatim to the other; the relay never
 // inspects, decrypts, or stores them. All end-to-end encryption happens on the
 // devices.
 //
-// Text frames are reserved for relay control messages (JSON, server to client
-// only). A client that sends a text frame is disconnected.
+// Text messages are reserved for relay control messages (JSON, server to client
+// only). A client that sends a text message is disconnected.
 package relay
 
 import (
@@ -52,14 +52,14 @@ const (
 	StatusSlowConsumer websocket.StatusCode = 4001
 )
 
-// Control message types sent by the relay as JSON text frames.
+// Control message types sent by the relay as JSON text messages.
 const (
 	MsgWelcome    = "welcome"
 	MsgPeerJoined = "peer_joined"
 	MsgPeerLeft   = "peer_left"
 )
 
-// ControlMessage is the JSON body of every relay-originated text frame.
+// ControlMessage is the JSON body of every relay-originated text message.
 type ControlMessage struct {
 	Type        string `json:"type"`
 	RoomID      string `json:"room_id,omitempty"`

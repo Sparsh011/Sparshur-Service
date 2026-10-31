@@ -44,6 +44,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if s.hub.Draining() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining", "stats": s.hub.Stats()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "stats": s.hub.Stats()})
 }
 
@@ -66,6 +70,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	role, ok := relay.ParseRole(r.URL.Query().Get("role"))
 	if !ok {
 		writeError(w, http.StatusBadRequest, `role must be "mac" or "android"`)
+		return
+	}
+	// The hub also rejects late joins; checking here lets clients see a
+	// plain 503 instead of an accepted-then-closed WebSocket.
+	if s.hub.Draining() {
+		writeError(w, http.StatusServiceUnavailable, "relay shutting down")
 		return
 	}
 
