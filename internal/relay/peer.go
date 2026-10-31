@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -34,6 +35,7 @@ type frame struct {
 type Peer struct {
 	hub    *Hub
 	conn   *websocket.Conn
+	raw    net.Conn // hijacked transport under conn; nil in unit tests
 	roomID string
 	role   Role
 	opts   Options
@@ -48,12 +50,15 @@ type Peer struct {
 	closeOnce sync.Once
 }
 
-// Serve runs a relay session for an accepted WebSocket connection and blocks
-// until the connection ends. Sessions started while the hub is draining are
-// closed immediately with StatusGoingAway.
-func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn, roomID string, role Role, opts Options) {
-	p := newPeer(ctx, h, conn, roomID, role, opts)
-	conn.SetReadLimit(opts.MaxMessageBytes)
+// Serve runs a relay session for a connection from Accept and blocks until
+// the connection ends. Sessions that reach the hub after draining has begun
+// are closed immediately with StatusGoingAway.
+func (h *Hub) Serve(ctx context.Context, c *Conn, roomID string, role Role, opts Options) {
+	defer h.active.Done() // taken by Accept
+	p := newPeer(ctx, h, c.ws, c.raw, roomID, role, opts)
+	c.ws.SetReadLimit(opts.MaxMessageBytes)
+	h.track(p)
+	defer h.untrack(p)
 
 	go p.writeLoop()
 	if opts.PingInterval > 0 {
@@ -65,17 +70,17 @@ func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn, roomID string, ro
 		<-p.closed
 		return
 	}
-	defer h.release(p)
 	p.readLoop()
 	h.leave(p)
 	<-p.closed
 }
 
-func newPeer(ctx context.Context, h *Hub, conn *websocket.Conn, roomID string, role Role, opts Options) *Peer {
+func newPeer(ctx context.Context, h *Hub, conn *websocket.Conn, raw net.Conn, roomID string, role Role, opts Options) *Peer {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Peer{
 		hub:    h,
 		conn:   conn,
+		raw:    raw,
 		roomID: roomID,
 		role:   role,
 		opts:   opts,
@@ -184,11 +189,14 @@ func (p *Peer) close(code websocket.StatusCode, reason string) {
 	})
 }
 
-// forceClose abandons a close handshake that has not finished in time.
-// Cancelling the session context aborts any in-flight read, write, or ping,
-// which makes the WebSocket library drop the TCP connection. Close itself
-// cannot be interrupted, so a handshake started after the read loop exited
-// is still bounded only by the library's own timeouts.
+// forceClose abandons a close handshake that has not finished in time. The
+// library's Close cannot be interrupted and CloseNow is a no-op while it runs,
+// so the hijacked transport is closed directly; every pending read and write,
+// including the handshake's own, then fails at once. Cancelling the context
+// stops the session's loops.
 func (p *Peer) forceClose() {
 	p.cancel()
+	if p.raw != nil {
+		_ = p.raw.Close()
+	}
 }

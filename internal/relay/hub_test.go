@@ -27,7 +27,7 @@ func testHub() *Hub {
 // messages the hub queues for it can be inspected directly. It must never be
 // closed; use connPeer for peers that may be.
 func queuePeer(h *Hub, room string, role Role, queue int) *Peer {
-	return newPeer(context.Background(), h, nil, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
+	return newPeer(context.Background(), h, nil, nil, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
 }
 
 // inertPeer is a queuePeer that is already marked closed, so the hub may
@@ -64,7 +64,7 @@ func connPeer(t *testing.T, h *Hub, room string, role Role, queue int) (*Peer, *
 	if srv == nil {
 		t.FailNow()
 	}
-	p := newPeer(context.Background(), h, srv, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
+	p := newPeer(context.Background(), h, srv, nil, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
 	// Close the client first so a pending server close handshake ends.
 	t.Cleanup(func() {
 		cli.CloseNow()
@@ -398,11 +398,21 @@ func TestForwardDropsWhilePeerOffline(t *testing.T) {
 	}
 }
 
-// serveHub runs h behind a real HTTP server and returns a dialer for it.
-func serveHub(t *testing.T, h *Hub) func(role Role) *websocket.Conn {
+// testServer runs a hub behind a real HTTP server, the way the server
+// package does.
+type testServer struct {
+	t   *testing.T
+	url string
+}
+
+func serveHub(t *testing.T, h *Hub) *testServer {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
+		c, err := h.Accept(w, r, nil)
+		if errors.Is(err, ErrDraining) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -414,16 +424,51 @@ func serveHub(t *testing.T, h *Hub) func(role Role) *websocket.Conn {
 		})
 	}))
 	t.Cleanup(ts.Close)
-	return func(role Role) *websocket.Conn {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c, _, err := websocket.Dial(ctx, wsURL(ts.URL)+"?role="+string(role), nil)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
+	return &testServer{t: t, url: wsURL(ts.URL)}
+}
+
+func (s *testServer) wsURL(role Role) string {
+	return s.url + "?role=" + string(role)
+}
+
+func (s *testServer) dial(role Role) *websocket.Conn {
+	s.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, s.wsURL(role), nil)
+	if err != nil {
+		s.t.Fatalf("dial: %v", err)
+	}
+	s.t.Cleanup(func() { c.CloseNow() })
+	return c
+}
+
+// waitFor polls cond until it holds, failing after 5s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
 		}
-		t.Cleanup(func() { c.CloseNow() })
-		return c
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitSessionsEnded fails unless every session admitted by h ends within 2s,
+// well under the WebSocket library's own 5s close-handshake timeout; only a
+// forced socket close can end a stalled handshake that quickly.
+func waitSessionsEnded(t *testing.T, h *Hub) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		h.active.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled session was not force-closed")
 	}
 }
 
@@ -467,10 +512,10 @@ func waitStatus(t *testing.T, ch <-chan websocket.StatusCode, want websocket.Sta
 
 func TestShutdownDrainsSessions(t *testing.T) {
 	h := testHub()
-	dial := serveHub(t, h)
-	mac := dial(RoleMac)
+	srv := serveHub(t, h)
+	mac := srv.dial(RoleMac)
 	readOne(t, mac)
-	android := dial(RoleAndroid)
+	android := srv.dial(RoleAndroid)
 	readOne(t, android)
 	readOne(t, mac) // peer_joined
 	macStatus, androidStatus := readUntilClose(mac), readUntilClose(android)
@@ -489,19 +534,22 @@ func TestShutdownDrainsSessions(t *testing.T) {
 		t.Fatalf("stats after shutdown = %+v", s)
 	}
 
-	// Late arrivals are turned away.
-	expectCloseStatus(t, dial(RoleMac), websocket.StatusGoingAway)
+	// Late arrivals are turned away before the upgrade.
+	_, resp, err := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("late dial: resp = %v, err = %v", resp, err)
+	}
 }
 
 // TestShutdownForceClosesStuckSessions checks that Shutdown waits for a
 // replaced connection that is still in its close handshake, and that the
-// deadline force-closes it instead of leaving it to the library's 5s timeout.
+// deadline force-closes it.
 func TestShutdownForceClosesStuckSessions(t *testing.T) {
 	h := testHub()
-	dial := serveHub(t, h)
-	oldMac := dial(RoleMac)
+	srv := serveHub(t, h)
+	oldMac := srv.dial(RoleMac)
 	readOne(t, oldMac) // then never read again, so its close handshake stalls
-	newMac := dial(RoleMac)
+	newMac := srv.dial(RoleMac)
 	if m := readOne(t, newMac); m.Type != MsgWelcome {
 		t.Fatalf("new mac got %+v", m)
 	}
@@ -513,15 +561,87 @@ func TestShutdownForceClosesStuckSessions(t *testing.T) {
 		t.Fatalf("Shutdown = %v, want deadline exceeded while replaced session is stuck", err)
 	}
 	waitStatus(t, newStatus, websocket.StatusGoingAway)
+	waitSessionsEnded(t, h)
+}
 
-	done := make(chan struct{})
-	go func() {
-		h.active.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("stuck session was not force-closed")
+// TestShutdownForceClosesAfterReadLoopExits covers a handshake that nothing
+// else is waiting on: the relay rejects a text message (1008), its read loop
+// exits, and the library's Close waits for a reply the client never sends.
+// Cancelling the session context cannot end that; closing the socket must.
+func TestShutdownForceClosesAfterReadLoopExits(t *testing.T) {
+	h := testHub()
+	srv := serveHub(t, h)
+	c := srv.dial(RoleMac)
+	readOne(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Write(ctx, websocket.MessageText, []byte("not allowed")); err != nil {
+		t.Fatal(err)
+	}
+	// leave runs only after the read loop has returned.
+	waitFor(t, "read loop to exit", func() bool { return h.Stats().Peers == 0 })
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelShutdown()
+	if err := h.Shutdown(shutdownCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want deadline exceeded while the 1008 handshake is stuck", err)
+	}
+	waitSessionsEnded(t, h)
+}
+
+// TestShutdownAwaitsUpgradeInProgress pauses an upgrade right after the hub
+// admitted it and starts shutdown before it reaches Serve. Shutdown must
+// still count the connection, and must kill it once it arrives if the
+// deadline has already passed. The client never reads, so only a forced
+// close can end its session promptly.
+func TestShutdownAwaitsUpgradeInProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		afterDeadline bool
+	}{
+		{"drain begins mid-upgrade", false},
+		{"deadline passes mid-upgrade", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testHub()
+			admitted, proceed := make(chan struct{}), make(chan struct{})
+			h.testHookAdmitted = func() {
+				close(admitted)
+				<-proceed
+			}
+			srv := serveHub(t, h)
+
+			dialed := make(chan *websocket.Conn, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				c, _, _ := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+				dialed <- c
+			}()
+			<-admitted
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			shutdownErr := make(chan error, 1)
+			go func() { shutdownErr <- h.Shutdown(ctx) }()
+			if tc.afterDeadline {
+				if err := <-shutdownErr; !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown = %v, want deadline exceeded with an upgrade pending", err)
+				}
+			} else {
+				waitFor(t, "drain to begin", h.Draining)
+			}
+
+			close(proceed)
+			if c := <-dialed; c != nil {
+				t.Cleanup(func() { c.CloseNow() })
+			}
+			if !tc.afterDeadline {
+				if err := <-shutdownErr; !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown = %v, want deadline exceeded while the late session is stuck", err)
+				}
+			}
+			waitSessionsEnded(t, h)
+		})
 	}
 }

@@ -20,17 +20,23 @@ type Hub struct {
 	// peer's own goroutines.
 	mu    sync.Mutex
 	rooms map[string]*room
-	// sessions holds every connection that joined and whose Serve has not
-	// returned yet, including connections that were replaced and are still
-	// finishing their close handshake.
+	// sessions holds every connection whose Serve is running, including
+	// connections that were replaced or refused and are still finishing
+	// their close handshake.
 	sessions map[*Peer]struct{}
 	draining bool
-	active   sync.WaitGroup
+	forcing  bool // Shutdown's deadline passed; late sessions are killed
+	// active counts connections from Accept until Serve returns, so it also
+	// covers upgrades that have not reached Serve yet.
+	active sync.WaitGroup
 
 	// testHookUnlocked, if set, runs right after join or leave releases mu.
 	// Tests use it to interleave another operation at the point where the
 	// messages queued by the first must already be in order.
 	testHookUnlocked func()
+	// testHookAdmitted, if set, runs in Accept right after a connection is
+	// admitted and before the WebSocket upgrade.
+	testHookAdmitted func()
 }
 
 type room struct {
@@ -68,8 +74,6 @@ func (h *Hub) join(p *Peer) bool {
 	// the first message p receives.
 	p.sendControl(ControlMessage{Type: MsgWelcome, RoomID: p.roomID, Role: p.role, PeerPresent: &present})
 	r.peers[p.role] = p
-	h.sessions[p] = struct{}{}
-	h.active.Add(1)
 
 	if old != nil {
 		old.close(StatusReplaced, "replaced by newer connection")
@@ -112,12 +116,25 @@ func (h *Hub) leave(p *Peer) {
 	h.log.Info("peer left", "room", logRoom(p.roomID), "role", p.role)
 }
 
-// release forgets a session once its connection has fully closed.
-func (h *Hub) release(p *Peer) {
+// track makes p visible to Shutdown. A session that arrives after the
+// shutdown deadline has passed is killed at once instead of being left to
+// its close handshake.
+func (h *Hub) track(p *Peer) {
+	h.mu.Lock()
+	h.sessions[p] = struct{}{}
+	forcing := h.forcing
+	h.mu.Unlock()
+	if forcing {
+		p.close(websocket.StatusGoingAway, "relay shutting down")
+		p.forceClose()
+	}
+}
+
+// untrack forgets a session once its connection has fully closed.
+func (h *Hub) untrack(p *Peer) {
 	h.mu.Lock()
 	delete(h.sessions, p)
 	h.mu.Unlock()
-	h.active.Done()
 }
 
 // forward delivers a message from p to its counterpart. Messages sent while
@@ -165,10 +182,11 @@ func (h *Hub) Draining() bool {
 }
 
 // Shutdown stops admitting new sessions, asks every active session to close
-// with StatusGoingAway, and waits for them to finish. If ctx ends first, the
-// remaining sessions are force-closed and ctx's error is returned without
-// waiting further. It is needed because http.Server.Shutdown neither closes
-// nor waits for hijacked connections.
+// with StatusGoingAway, and waits for them, including upgrades admitted but
+// not yet serving, to finish. If ctx ends first, the remaining sessions'
+// sockets are closed outright and ctx's error is returned without waiting
+// further. It is needed because http.Server.Shutdown neither closes nor
+// waits for hijacked connections.
 func (h *Hub) Shutdown(ctx context.Context) error {
 	h.mu.Lock()
 	h.draining = true
@@ -191,6 +209,7 @@ func (h *Hub) Shutdown(ctx context.Context) error {
 	}
 
 	h.mu.Lock()
+	h.forcing = true
 	peers = h.sessionList()
 	h.mu.Unlock()
 	h.log.Warn("shutdown deadline exceeded, force-closing connections", "remaining", len(peers))
