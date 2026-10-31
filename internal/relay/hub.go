@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -24,8 +25,12 @@ type Hub struct {
 	// connections that were replaced or refused and are still finishing
 	// their close handshake.
 	sessions map[*Peer]struct{}
-	draining bool
-	forcing  bool // Shutdown's deadline passed; late sessions are killed
+	// upgrading holds connections hijacked by Accept that have not reached
+	// Serve yet. track moves a connection from here to sessions under mu, so
+	// Shutdown always finds it in exactly one of the two.
+	upgrading map[net.Conn]struct{}
+	draining  bool
+	forcing   bool // Shutdown's deadline passed; late sessions are killed
 	// active counts connections from Accept until Serve returns, so it also
 	// covers upgrades that have not reached Serve yet.
 	active sync.WaitGroup
@@ -37,6 +42,9 @@ type Hub struct {
 	// testHookAdmitted, if set, runs in Accept right after a connection is
 	// admitted and before the WebSocket upgrade.
 	testHookAdmitted func()
+	// testHookHijacked, if set, runs right after Accept's connection has
+	// been hijacked and registered, before the upgrade completes.
+	testHookHijacked func()
 }
 
 type room struct {
@@ -46,9 +54,10 @@ type room struct {
 // NewHub creates an empty hub.
 func NewHub(log *slog.Logger) *Hub {
 	return &Hub{
-		log:      log,
-		rooms:    make(map[string]*room),
-		sessions: make(map[*Peer]struct{}),
+		log:       log,
+		rooms:     make(map[string]*room),
+		sessions:  make(map[*Peer]struct{}),
+		upgrading: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -121,6 +130,9 @@ func (h *Hub) leave(p *Peer) {
 // its close handshake.
 func (h *Hub) track(p *Peer) {
 	h.mu.Lock()
+	if p.raw != nil {
+		delete(h.upgrading, p.raw)
+	}
 	h.sessions[p] = struct{}{}
 	forcing := h.forcing
 	h.mu.Unlock()
@@ -211,10 +223,17 @@ func (h *Hub) Shutdown(ctx context.Context) error {
 	h.mu.Lock()
 	h.forcing = true
 	peers = h.sessionList()
+	upgrading := make([]net.Conn, 0, len(h.upgrading))
+	for c := range h.upgrading {
+		upgrading = append(upgrading, c)
+	}
 	h.mu.Unlock()
-	h.log.Warn("shutdown deadline exceeded, force-closing connections", "remaining", len(peers))
+	h.log.Warn("shutdown deadline exceeded, force-closing connections", "remaining", len(peers), "upgrading", len(upgrading))
 	for _, p := range peers {
 		p.forceClose()
+	}
+	for _, c := range upgrading {
+		_ = c.Close()
 	}
 	return ctx.Err()
 }

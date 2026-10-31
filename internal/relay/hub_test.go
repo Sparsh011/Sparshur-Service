@@ -645,3 +645,51 @@ func TestShutdownAwaitsUpgradeInProgress(t *testing.T) {
 		})
 	}
 }
+
+// TestShutdownClosesUpgradeStalledAfterHijack parks an upgrade after net/http
+// has handed the socket over but before Accept returns, so no session exists
+// yet. At the deadline the socket itself must be closed while the upgrade is
+// still parked, not only once it eventually reaches Serve.
+func TestShutdownClosesUpgradeStalledAfterHijack(t *testing.T) {
+	h := testHub()
+	hijacked, release := make(chan struct{}), make(chan struct{})
+	h.testHookHijacked = func() {
+		close(hijacked)
+		<-release
+	}
+	srv := serveHub(t, h)
+
+	dialed := make(chan *websocket.Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, _, _ := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+		dialed <- c
+	}()
+	<-hijacked
+	// net/http flushes the 101 inside Hijack, so the client is connected
+	// even though the server side is still parked in the hook.
+	c := <-dialed
+	if c == nil {
+		close(release)
+		t.Fatal("dial failed")
+	}
+	t.Cleanup(func() { c.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := h.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		close(release)
+		t.Fatalf("Shutdown = %v, want deadline exceeded with an upgrade stalled", err)
+	}
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRead()
+	_, _, err := c.Read(readCtx)
+	stalledOpen := readCtx.Err() != nil
+	close(release)
+	if err == nil || stalledOpen {
+		t.Fatalf("socket stayed open while the upgrade was stalled (err %v)", err)
+	}
+	waitSessionsEnded(t, h)
+}
