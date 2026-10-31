@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,6 +381,59 @@ func TestQueueOverflowDisconnectsSlowConsumer(t *testing.T) {
 
 	expectClosed(t, mac)
 	expectCloseStatus(t, macClient, StatusSlowConsumer)
+}
+
+// blockingWriter stalls every write after it is armed until released, like a
+// log sink whose pipe has filled up.
+type blockingWriter struct {
+	armed   atomic.Bool
+	entered chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (w *blockingWriter) Write(b []byte) (int, error) {
+	if w.armed.Load() {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
+	}
+	return len(b), nil
+}
+
+// TestBlockedLoggingDoesNotStallHub checks that the slow-consumer warning is
+// written after the hub lock is released: a stuck log sink must not stop
+// routing or the readiness probe. Ported from the target branch.
+func TestBlockedLoggingDoesNotStallHub(t *testing.T) {
+	w := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
+	android, androidClient := connPeer(t, h, testRoom, RoleAndroid, 1)
+	mac := queuePeer(h, testRoom, RoleMac, 8)
+	h.join(android) // fills android's one-slot queue with its welcome
+
+	w.armed.Store(true)
+	joined := make(chan struct{})
+	go func() {
+		defer close(joined)
+		h.join(mac) // peer_joined overflows android's queue and gets logged
+	}()
+	t.Cleanup(func() {
+		close(w.release)
+		<-joined
+	})
+	select {
+	case <-w.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing was logged")
+	}
+
+	stats := make(chan Stats, 1)
+	go func() { stats <- h.Stats() }()
+	select {
+	case <-stats:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hub lock held while logging")
+	}
+	expectCloseStatus(t, androidClient, StatusSlowConsumer)
 }
 
 func TestForwardDropsWhilePeerOffline(t *testing.T) {
