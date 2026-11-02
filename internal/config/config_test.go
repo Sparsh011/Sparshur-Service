@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,6 +57,35 @@ func TestLoadRejectsInvalid(t *testing.T) {
 			t.Setenv(c.key, c.value)
 			if cfg, err := Load(); err == nil {
 				t.Fatalf("Load succeeded: %+v", cfg)
+			}
+		})
+	}
+}
+
+// Ported from the Sparshur-Service master branch (bb9f96c, PR #1). Its
+// TestLoadDefaults is covered by the stricter TestLoadDefaults above.
+func TestLoadValidatesConnectionSettings(t *testing.T) {
+	cases := []struct {
+		key, value, wantErr string
+	}{
+		{"RELAY_PING_INTERVAL", "0", ""},
+		{"RELAY_PING_INTERVAL", "-1s", "RELAY_PING_INTERVAL"},
+		{"RELAY_WRITE_TIMEOUT", "0", "RELAY_WRITE_TIMEOUT"},
+		{"RELAY_WRITE_TIMEOUT", "-1s", "RELAY_WRITE_TIMEOUT"},
+		{"RELAY_SHUTDOWN_TIMEOUT", "0", "RELAY_SHUTDOWN_TIMEOUT"},
+		{"RELAY_SHUTDOWN_TIMEOUT", "-1s", "RELAY_SHUTDOWN_TIMEOUT"},
+		{"RELAY_SEND_QUEUE_SIZE", "0", "RELAY_SEND_QUEUE_SIZE"},
+		{"RELAY_MAX_MESSAGE_BYTES", "0", "RELAY_MAX_MESSAGE_BYTES"},
+	}
+	for _, c := range cases {
+		t.Run(c.key+"="+c.value, func(t *testing.T) {
+			t.Setenv(c.key, c.value)
+			_, err := Load()
+			switch {
+			case c.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)):
+				t.Fatalf("err = %v, want mention of %s", err, c.wantErr)
 			}
 		})
 	}
