@@ -1,14 +1,18 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -390,6 +394,11 @@ type blockingWriter struct {
 	entered chan struct{}
 	once    sync.Once
 	release chan struct{}
+	writes  atomic.Int64 // completed writes
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
 }
 
 func (w *blockingWriter) Write(b []byte) (int, error) {
@@ -397,6 +406,7 @@ func (w *blockingWriter) Write(b []byte) (int, error) {
 		w.once.Do(func() { close(w.entered) })
 		<-w.release
 	}
+	w.writes.Add(1)
 	return len(b), nil
 }
 
@@ -404,7 +414,7 @@ func (w *blockingWriter) Write(b []byte) (int, error) {
 // written after the hub lock is released: a stuck log sink must not stop
 // routing or the readiness probe. Ported from the target branch.
 func TestBlockedLoggingDoesNotStallHub(t *testing.T) {
-	w := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	w := newBlockingWriter()
 	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
 	android, androidClient := connPeer(t, h, testRoom, RoleAndroid, 1)
 	mac := queuePeer(h, testRoom, RoleMac, 8)
@@ -746,4 +756,108 @@ func TestShutdownClosesUpgradeStalledAfterHijack(t *testing.T) {
 		t.Fatalf("socket stayed open while the upgrade was stalled (err %v)", err)
 	}
 	waitSessionsEnded(t, h)
+}
+
+// rawDial performs the WebSocket upgrade over plain TCP and then does nothing
+// at the WebSocket layer, so it never answers a close handshake. Whether the
+// relay closed the socket is then observable as EOF, independently of any
+// handshake.
+func rawDial(t *testing.T, wsURL string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	req := "GET " + u.RequestURI() + " HTTP/1.1\r\nHost: " + u.Host +
+		"\r\nUpgrade: websocket\r\nConnection: Upgrade" +
+		"\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("upgrade response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d", resp.StatusCode)
+	}
+	return c, br
+}
+
+// expectSocketClosed reads and discards until the relay closes the TCP
+// connection, failing if it is still open after 2s.
+func expectSocketClosed(t *testing.T, c net.Conn, br *bufio.Reader) {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.Copy(io.Discard, br); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("relay did not close the socket")
+	}
+}
+
+// shutdownWithin runs Shutdown with a 200ms deadline and requires it to
+// return context.DeadlineExceeded within 2s.
+func shutdownWithin(t *testing.T, h *Hub) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.Shutdown(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after its deadline")
+	}
+}
+
+// TestShutdownDeadlineWithBlockedLogging: an established session never
+// answers the close handshake and the log sink is stuck. Shutdown must still
+// close the socket and return at its deadline.
+func TestShutdownDeadlineWithBlockedLogging(t *testing.T) {
+	w := newBlockingWriter()
+	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
+	srv := serveHub(t, h)
+	t.Cleanup(func() { close(w.release) })
+
+	c, br := rawDial(t, srv.wsURL(RoleMac))
+	// The "peer joined" line is the session's only log before it is
+	// established; arm the sink once it has been written.
+	waitFor(t, "join to be logged", func() bool { return w.writes.Load() == 1 })
+	w.armed.Store(true)
+
+	shutdownWithin(t, h)
+	expectSocketClosed(t, c, br)
+}
+
+// TestShutdownDeadlineWithBlockedLoggingDuringUpgrade: as above, but the
+// upgrade is parked after hijacking, so no session exists yet.
+func TestShutdownDeadlineWithBlockedLoggingDuringUpgrade(t *testing.T) {
+	w := newBlockingWriter()
+	w.armed.Store(true)
+	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
+	hijacked, release := make(chan struct{}), make(chan struct{})
+	h.testHookHijacked = func() {
+		close(hijacked)
+		<-release
+	}
+	srv := serveHub(t, h)
+	t.Cleanup(func() {
+		close(release)
+		close(w.release)
+	})
+
+	c, br := rawDial(t, srv.wsURL(RoleMac))
+	<-hijacked
+
+	shutdownWithin(t, h)
+	expectSocketClosed(t, c, br)
 }

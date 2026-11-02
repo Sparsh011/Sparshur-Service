@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -217,9 +218,10 @@ func (h *Hub) Draining() bool {
 // Shutdown stops admitting new sessions, asks every active session to close
 // with StatusGoingAway, and waits for them, including upgrades admitted but
 // not yet serving, to finish. If ctx ends first, the remaining sessions'
-// sockets are closed outright and ctx's error is returned without waiting
-// further. It is needed because http.Server.Shutdown neither closes nor
-// waits for hijacked connections.
+// sockets are closed outright and an error wrapping ctx's error is returned
+// without waiting further. Shutdown never logs, so a stuck log sink cannot
+// hold sockets open past the deadline. It is needed because
+// http.Server.Shutdown neither closes nor waits for hijacked connections.
 func (h *Hub) Shutdown(ctx context.Context) error {
 	h.mu.Lock()
 	h.draining = true
@@ -249,14 +251,15 @@ func (h *Hub) Shutdown(ctx context.Context) error {
 		upgrading = append(upgrading, c)
 	}
 	h.mu.Unlock()
-	h.log.Warn("shutdown deadline exceeded, force-closing connections", "remaining", len(peers), "upgrading", len(upgrading))
+	// No logging here: a stuck log sink must not delay closing sockets or
+	// returning. The caller reports the error once Shutdown has returned.
 	for _, p := range peers {
 		p.forceClose()
 	}
 	for _, c := range upgrading {
 		_ = c.Close()
 	}
-	return ctx.Err()
+	return fmt.Errorf("force-closed %d sessions and %d upgrades: %w", len(peers), len(upgrading), ctx.Err())
 }
 
 func (h *Hub) sessionList() []*Peer {
