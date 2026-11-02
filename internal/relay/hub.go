@@ -36,11 +36,11 @@ type Hub struct {
 	// covers upgrades that have not reached Serve yet.
 	active sync.WaitGroup
 
-	// testHookUnlocked, if set, runs right after join or leave ("join" or
+	// afterUnlock, if set, runs right after join or leave ("join" or
 	// "leave") releases mu for peer p. Tests use it to interleave another
 	// operation at the point where the messages queued by the first must
 	// already be in order.
-	testHookUnlocked func(op string, p *Peer)
+	afterUnlock func(op string, p *Peer)
 	// testHookAdmitted, if set, runs in Accept right after a connection is
 	// admitted and before the WebSocket upgrade.
 	testHookAdmitted func()
@@ -99,9 +99,10 @@ func (h *Hub) join(p *Peer) bool {
 			slow = append(slow, other)
 		}
 	}
+	hook := h.afterUnlock
 	h.mu.Unlock()
-	if h.testHookUnlocked != nil {
-		h.testHookUnlocked("join", p)
+	if hook != nil {
+		hook("join", p)
 	}
 
 	logSlow(slow...)
@@ -127,9 +128,10 @@ func (h *Hub) leave(p *Peer) {
 	if len(r.peers) == 0 {
 		delete(h.rooms, p.roomID)
 	}
+	hook := h.afterUnlock
 	h.mu.Unlock()
-	if h.testHookUnlocked != nil {
-		h.testHookUnlocked("leave", p)
+	if hook != nil {
+		hook("leave", p)
 	}
 
 	logSlow(slow)

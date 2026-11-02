@@ -205,8 +205,8 @@ func expectPresenceAgreement(t *testing.T, mac, android *Peer) {
 // hookOnce makes fn run the first time join or leave releases the hub lock.
 // The hook clears itself first, so fn may call join or leave.
 func hookOnce(h *Hub, fn func()) {
-	h.testHookUnlocked = func(string, *Peer) {
-		h.testHookUnlocked = nil
+	h.afterUnlock = func(string, *Peer) {
+		h.afterUnlock = nil
 		fn()
 	}
 }

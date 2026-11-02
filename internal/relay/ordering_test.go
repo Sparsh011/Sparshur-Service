@@ -127,7 +127,7 @@ func dump(frames []frame) string {
 func pauseAt(t *testing.T, h *Hub, op string, target *Peer, run func(), during func()) {
 	t.Helper()
 	paused, resume := make(chan struct{}), make(chan struct{})
-	h.testHookUnlocked = func(gotOp string, p *Peer) {
+	h.afterUnlock = func(gotOp string, p *Peer) {
 		if gotOp == op && p == target {
 			close(paused)
 			<-resume
@@ -146,7 +146,7 @@ func pauseAt(t *testing.T, h *Hub, op string, target *Peer, run func(), during f
 	during()
 	close(resume)
 	<-finished
-	h.testHookUnlocked = nil
+	h.afterUnlock = nil
 }
 
 func TestSimultaneousJoinsSeeConsistentPresence(t *testing.T) {
