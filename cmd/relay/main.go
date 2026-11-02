@@ -17,25 +17,39 @@ import (
 	"github.com/sparshchadha/sparshur-service/internal/server"
 )
 
+// logQueueSize bounds buffered log lines; beyond it lines are dropped
+// rather than blocking the relay.
+const logQueueSize = 1024
+
 func main() {
-	if err := run(); err != nil {
-		slog.Error("relay exited", "err", err)
+	// Every log write goes through a queue that never blocks, so a stuck
+	// stdout cannot stop the relay from serving, shutting down, or exiting.
+	out := newAsyncWriter(os.Stdout, logQueueSize)
+	level := new(slog.LevelVar)
+	log := slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(log)
+
+	err := run(log, level)
+	if err != nil {
+		log.Error("relay exited", "err", err)
+	}
+	// Best effort only; exit regardless once the time is up.
+	out.Flush(time.Second)
+	if err != nil {
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(log *slog.Logger, level *slog.LevelVar) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		return err
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-	slog.SetDefault(log)
+	level.Set(l)
 
 	hub := relay.NewHub(log)
 	srv := &http.Server{
@@ -60,9 +74,10 @@ func run() error {
 	case <-ctx.Done():
 	}
 
-	log.Info("shutting down")
+	// Start the deadline before anything else, logging included.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	log.Info("shutting down")
 	// srv.Shutdown closes the listener and drains plain HTTP requests, but
 	// neither closes nor waits for hijacked WebSocket connections; the hub
 	// drains those in parallel under the same deadline.
