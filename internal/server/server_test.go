@@ -261,11 +261,40 @@ func TestMessagesDroppedWhilePeerOffline(t *testing.T) {
 	readControl(t, mac)
 	write(t, mac, websocket.MessageBinary, []byte("nobody home"))
 
+	// Barrier: the relay's read loop handles mac's frames in order and
+	// answers a ping only after it has dropped the message sent before it.
+	// Ping needs a concurrent reader on mac to receive the pong; that reader
+	// then picks up the peer_joined below.
+	type result struct {
+		typ  websocket.MessageType
+		data []byte
+		err  error
+	}
+	next := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		typ, data, err := mac.Read(ctx)
+		next <- result{typ, data, err}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := mac.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
 	android := dial(t, ts, testRoom, relay.RoleAndroid)
 	if m := readControl(t, android); m.Type != relay.MsgWelcome || !*m.PeerPresent {
 		t.Fatalf("android welcome = %+v", m)
 	}
-	readControl(t, mac) // peer_joined
+	r := <-next
+	if r.err != nil {
+		t.Fatalf("mac read: %v", r.err)
+	}
+	var m relay.ControlMessage
+	if r.typ != websocket.MessageText || json.Unmarshal(r.data, &m) != nil || m.Type != relay.MsgPeerJoined {
+		t.Fatalf("mac got %v %q, want peer_joined", r.typ, r.data)
+	}
 	write(t, mac, websocket.MessageBinary, []byte("now"))
 	if _, got := read(t, android); string(got) != "now" {
 		t.Fatalf("android got %q; offline message was not dropped", got)
