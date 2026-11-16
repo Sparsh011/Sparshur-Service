@@ -60,10 +60,23 @@ handshake.
 TLS is expected to be terminated in front of the relay (load balancer or
 reverse proxy); clients should always connect with `wss://`.
 
+## Deployment
+
+The same binary runs on a Linux VPS or a Mac mini. For a private VPN
+(Tailscale) deployment, set `RELAY_ADDR=127.0.0.1:8080` and terminate TLS on
+the tailnet; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and `deploy/`.
+
+```sh
+make dist                                   # cross-compile for linux and darwin
+make check RELAY_URL=https://relay-host.example-tailnet.ts.net   # smoke-test a deployment
+```
+
 ## Layout
 
 ```
 cmd/relay/          entrypoint, signal handling, graceful shutdown
+cmd/relaycheck/     deployment smoke test (not part of the relay binary)
+deploy/             systemd unit, launchd plist, Caddyfile, env example
 internal/config/    environment configuration
 internal/relay/     rooms, peers, forwarding, control protocol
 internal/server/    HTTP routes and WebSocket upgrade

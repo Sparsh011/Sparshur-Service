@@ -1,0 +1,20 @@
+# TLS termination for the relay on a tailnet, as an alternative to
+# `tailscale serve`. Replace both placeholders:
+#   relay-host.example-tailnet.ts.net  this machine's MagicDNS name
+#   100.64.0.1                         this machine's Tailscale IPv4 address
+#
+# Caddy obtains the *.ts.net certificate from the local tailscaled, so the
+# certificate is publicly trusted and clients need no custom CA.
+relay-host.example-tailnet.ts.net {
+	# Listen only on the tailnet interface, never on LAN or public addresses.
+	bind 100.64.0.1
+
+	# Expose the wire contract and nothing else.
+	@relay path /healthz /readyz /v1/rooms /v1/rooms/*
+	handle @relay {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond 404
+	}
+}
