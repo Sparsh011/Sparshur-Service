@@ -1,12 +1,18 @@
 package relay
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,83 +24,66 @@ import (
 
 const testRoom = "test-room-0123456789abcdef"
 
-func newTestHub() *Hub {
+func testHub() *Hub {
 	return NewHub(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// newPeer builds a peer without read/write loops so tests can inspect its
-// send queue directly. conn may be nil when the test never closes the peer.
-func newPeer(h *Hub, room string, role Role, queue int, conn *websocket.Conn) *Peer {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Peer{
-		hub:    h,
-		conn:   conn,
-		roomID: room,
-		role:   role,
-		opts:   Options{SendQueueSize: queue, WriteTimeout: time.Second},
-		log:    h.log,
-		ctx:    ctx,
-		cancel: cancel,
-		send:   make(chan frame, queue),
-		done:   make(chan struct{}),
-		closed: make(chan struct{}),
-	}
+// queuePeer returns a peer with no connection and no I/O goroutines, so the
+// messages the hub queues for it can be inspected directly. It must never be
+// closed; use connPeer for peers that may be.
+func queuePeer(h *Hub, room string, role Role, queue int) *Peer {
+	return newPeer(context.Background(), h, nil, nil, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
 }
 
-// wsPairs returns a function that yields a server-side WebSocket connection
-// and a channel reporting the close status its client observes. The client
-// keeps reading so server-initiated close handshakes complete.
-func wsPairs(t *testing.T) func() (*websocket.Conn, <-chan websocket.StatusCode) {
+// inertPeer is a queuePeer that is already marked closed, so the hub may
+// close it (e.g. on replacement) without touching a connection.
+func inertPeer(h *Hub, room string, role Role) *Peer {
+	p := queuePeer(h, room, role, 8)
+	p.closeOnce.Do(func() { close(p.done) })
+	return p
+}
+
+// connPeer is like queuePeer but backed by a real WebSocket connection, so
+// it can be closed. It returns the client end of the connection.
+func connPeer(t *testing.T, h *Hub, room string, role Role, queue int) (*Peer, *websocket.Conn) {
 	t.Helper()
-	accepted := make(chan *websocket.Conn, 1)
+	conns := make(chan *websocket.Conn, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			t.Errorf("accept: %v", err)
+			close(conns)
 			return
 		}
-		accepted <- c
+		conns <- c
 	}))
 	t.Cleanup(ts.Close)
-	url := "ws" + strings.TrimPrefix(ts.URL, "http")
-	return func() (*websocket.Conn, <-chan websocket.StatusCode) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		c, _, err := websocket.Dial(ctx, url, nil)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
-		}
-		status := make(chan websocket.StatusCode, 1)
-		go func() {
-			for {
-				if _, _, err := c.Read(context.Background()); err != nil {
-					status <- websocket.CloseStatus(err)
-					return
-				}
-			}
-		}()
-		s := <-accepted
-		t.Cleanup(func() {
-			c.CloseNow()
-			s.CloseNow()
-		})
-		return s, status
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cli, _, err := websocket.Dial(ctx, wsURL(ts.URL), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
+	srv := <-conns
+	if srv == nil {
+		t.FailNow()
+	}
+	p := newPeer(context.Background(), h, srv, nil, room, role, Options{SendQueueSize: queue, WriteTimeout: time.Second})
+	// Close the client first so a pending server close handshake ends.
+	t.Cleanup(func() {
+		cli.CloseNow()
+		srv.CloseNow()
+		p.cancel()
+	})
+	return p, cli
 }
 
-func expectStatus(t *testing.T, status <-chan websocket.StatusCode, want websocket.StatusCode) {
-	t.Helper()
-	select {
-	case got := <-status:
-		if got != want {
-			t.Fatalf("close status = %v, want %v", got, want)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("client never saw close")
-	}
+func wsURL(httpURL string) string {
+	return "ws" + strings.TrimPrefix(httpURL, "http")
 }
 
-// drain returns everything currently queued for p.
+// drain removes and returns everything queued for p.
 func drain(p *Peer) []frame {
 	var out []frame
 	for {
@@ -107,10 +96,10 @@ func drain(p *Peer) []frame {
 	}
 }
 
-func decode(t *testing.T, f frame) ControlMessage {
+func control(t *testing.T, f frame) ControlMessage {
 	t.Helper()
 	if f.typ != websocket.MessageText {
-		t.Fatalf("expected control frame, got %v %q", f.typ, f.data)
+		t.Fatalf("expected control message, got %v %q", f.typ, f.data)
 	}
 	var m ControlMessage
 	if err := json.Unmarshal(f.data, &m); err != nil {
@@ -119,218 +108,283 @@ func decode(t *testing.T, f frame) ControlMessage {
 	return m
 }
 
-// checkPresence replays the presence messages in frames the way a client
-// would and fails if they are inconsistent: a welcome must come first when
-// wantWelcome is set, peer_joined is only valid while the peer is absent and
-// peer_left only while it is present. It returns the final presence.
-func checkPresence(t *testing.T, frames []frame, present, wantWelcome bool) bool {
+func expectWelcome(t *testing.T, f frame, present bool) {
 	t.Helper()
-	for i, f := range frames {
-		if f.typ != websocket.MessageText {
-			if wantWelcome && i == 0 {
-				t.Fatalf("data frame delivered before welcome")
-			}
+	m := control(t, f)
+	if m.Type != MsgWelcome || m.PeerPresent == nil || *m.PeerPresent != present {
+		t.Fatalf("got %+v, want welcome with peer_present=%v", m, present)
+	}
+}
+
+func expectClosed(t *testing.T, p *Peer) {
+	t.Helper()
+	select {
+	case <-p.done:
+	default:
+		t.Fatal("peer was not closed")
+	}
+}
+
+func expectCloseStatus(t *testing.T, c *websocket.Conn, want websocket.StatusCode) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		_, _, err := c.Read(ctx)
+		if err == nil {
 			continue
 		}
-		m := decode(t, f)
-		switch {
-		case i == 0 && wantWelcome:
-			if m.Type != MsgWelcome {
-				t.Fatalf("first message = %+v, want welcome", m)
+		if got := websocket.CloseStatus(err); got != want {
+			t.Fatalf("close status = %v, want %v (err %v)", got, want, err)
+		}
+		return
+	}
+}
+
+func TestWelcomeIsFirstMessage(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		h := testHub()
+		mac := queuePeer(h, testRoom, RoleMac, 1024)
+		h.join(mac)
+		drain(mac)
+
+		// Forward continuously from mac while android joins; nothing may
+		// reach android ahead of its welcome.
+		android := queuePeer(h, testRoom, RoleAndroid, 1024)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 200; j++ {
+				h.forward(mac, websocket.MessageBinary, []byte{byte(j)})
 			}
-			present = *m.PeerPresent
-		case m.Type == MsgPeerJoined && !present:
-			present = true
-		case m.Type == MsgPeerLeft && present:
-			present = false
-		default:
-			t.Fatalf("message %d %+v inconsistent with presence %v (all: %s)", i, m, present, dump(frames))
+		}()
+		close(start)
+		h.join(android)
+		wg.Wait()
+
+		got := drain(android)
+		expectWelcome(t, got[0], true)
+		for _, f := range got[1:] {
+			if f.typ != websocket.MessageBinary {
+				t.Fatalf("unexpected message after welcome: %v %q", f.typ, f.data)
+			}
 		}
 	}
-	return present
 }
 
-func dump(frames []frame) string {
-	var parts []string
-	for _, f := range frames {
-		parts = append(parts, string(f.data))
-	}
-	return strings.Join(parts, " ")
-}
-
-// pauseAt makes h stop the given operation on target right after it releases
-// the hub lock, runs during while it is stopped, then lets it finish. This
-// forces the interleaving where another operation completes inside what was
-// the original implementation's window between unlocking and queuing.
-func pauseAt(t *testing.T, h *Hub, op string, target *Peer, run func(), during func()) {
+// expectPresenceAgreement checks the queues of two peers that joined the
+// same room concurrently: exactly one saw an empty room, and that one then
+// got peer_joined for the other; the second got nothing after its welcome.
+func expectPresenceAgreement(t *testing.T, mac, android *Peer) {
 	t.Helper()
-	paused, resume := make(chan struct{}), make(chan struct{})
-	h.afterUnlock = func(gotOp string, p *Peer) {
-		if gotOp == op && p == target {
-			close(paused)
-			<-resume
-		}
+	macMsgs, androidMsgs := drain(mac), drain(android)
+	macPresent := *control(t, macMsgs[0]).PeerPresent
+	androidPresent := *control(t, androidMsgs[0]).PeerPresent
+	if macPresent == androidPresent {
+		t.Fatalf("both peers saw peer_present=%v", macPresent)
 	}
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		run()
-	}()
-	select {
-	case <-paused:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("%s never reached the pause point", op)
+	first, second := macMsgs, androidMsgs
+	secondRole := RoleAndroid
+	if macPresent {
+		first, second, secondRole = androidMsgs, macMsgs, RoleMac
 	}
-	during()
-	close(resume)
-	<-finished
-	h.afterUnlock = nil
-}
-
-func TestSimultaneousJoinsSeeConsistentPresence(t *testing.T) {
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
-	android := newPeer(h, testRoom, RoleAndroid, 8, nil)
-	// The mac registers first but android's whole join runs before the mac's
-	// join continues, so android's peer_joined must not precede mac's welcome.
-	pauseAt(t, h, "join", mac, func() { h.join(mac) }, func() { h.join(android) })
-
-	if !checkPresence(t, drain(mac), false, true) {
-		t.Fatal("mac does not see android")
+	if len(first) != 2 {
+		t.Fatalf("first joiner got %d messages, want welcome then peer_joined", len(first))
 	}
-	if !checkPresence(t, drain(android), false, true) {
-		t.Fatal("android does not see mac")
+	if m := control(t, first[1]); m.Type != MsgPeerJoined || m.Role != secondRole {
+		t.Fatalf("first joiner got %+v, want peer_joined %s", m, secondRole)
+	}
+	if len(second) != 1 {
+		t.Fatalf("second joiner got %d messages, want welcome only", len(second))
 	}
 }
 
-func TestForwardDoesNotOvertakeWelcome(t *testing.T) {
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+// hookOnce makes fn run the first time join or leave releases the hub lock.
+// The hook clears itself first, so fn may call join or leave.
+func hookOnce(h *Hub, fn func()) {
+	h.afterUnlock = func(string, *Peer) {
+		h.afterUnlock = nil
+		fn()
+	}
+}
+
+func TestWelcomePrecedesMessageForwardedRightAfterJoin(t *testing.T) {
+	h := testHub()
+	mac := queuePeer(h, testRoom, RoleMac, 8)
 	h.join(mac)
 	drain(mac)
-	android := newPeer(h, testRoom, RoleAndroid, 8, nil)
-	pauseAt(t, h, "join", android, func() { h.join(android) }, func() {
-		h.forward(mac, websocket.MessageBinary, []byte("data"))
-	})
 
-	f := drain(android)
-	checkPresence(t, f, false, true)
-	if len(f) != 2 || string(f[1].data) != "data" {
-		t.Fatalf("android got %s", dump(f))
+	android := queuePeer(h, testRoom, RoleAndroid, 8)
+	hookOnce(h, func() { h.forward(mac, websocket.MessageBinary, []byte("early")) })
+	h.join(android)
+
+	got := drain(android)
+	if len(got) != 2 {
+		t.Fatalf("android got %d messages, want welcome then the forwarded one", len(got))
+	}
+	expectWelcome(t, got[0], true)
+	if string(got[1].data) != "early" {
+		t.Fatalf("second message = %q", got[1].data)
 	}
 }
 
-func TestLeaveRejoinKeepsOrder(t *testing.T) {
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
-	oldAndroid := newPeer(h, testRoom, RoleAndroid, 8, nil)
+func TestPeerLeftPrecedesRejoinRightAfterLeave(t *testing.T) {
+	h := testHub()
+	mac := queuePeer(h, testRoom, RoleMac, 8)
+	oldAndroid := queuePeer(h, testRoom, RoleAndroid, 8)
 	h.join(mac)
 	h.join(oldAndroid)
 	drain(mac)
 
-	// The old connection's cleanup has unregistered it, and the new
-	// connection joins before that cleanup finishes; the mac must still end
-	// up seeing android present.
-	newAndroid := newPeer(h, testRoom, RoleAndroid, 8, nil)
-	pauseAt(t, h, "leave", oldAndroid, func() { h.leave(oldAndroid) }, func() { h.join(newAndroid) })
+	hookOnce(h, func() { h.join(queuePeer(h, testRoom, RoleAndroid, 8)) })
+	h.leave(oldAndroid)
 
-	if !checkPresence(t, drain(mac), true, false) {
-		t.Fatal("mac does not see rejoined android")
+	got := drain(mac)
+	if len(got) != 2 || control(t, got[0]).Type != MsgPeerLeft || control(t, got[1]).Type != MsgPeerJoined {
+		t.Fatalf("mac did not get peer_left then peer_joined: %d messages", len(got))
 	}
-	if !checkPresence(t, drain(newAndroid), false, true) {
-		t.Fatal("new android does not see mac")
+}
+
+func TestConcurrentJoinsAgreeOnPresence(t *testing.T) {
+	const rooms = 50
+	h := testHub()
+	peers := make([][2]*Peer, rooms)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range peers {
+		room := fmt.Sprintf("%s-%02d", testRoom, i)
+		peers[i] = [2]*Peer{queuePeer(h, room, RoleMac, 8), queuePeer(h, room, RoleAndroid, 8)}
+		for _, p := range peers[i] {
+			wg.Add(1)
+			go func(p *Peer) {
+				defer wg.Done()
+				<-start
+				if !h.join(p) {
+					t.Error("join rejected")
+				}
+			}(p)
+		}
 	}
-	if s := h.Stats(); s.Peers != 2 {
+	close(start)
+	wg.Wait()
+
+	if s := h.Stats(); s.Rooms != rooms || s.Peers != 2*rooms {
 		t.Fatalf("stats = %+v", s)
 	}
-}
-
-func TestReplacementOfEitherRole(t *testing.T) {
-	pairs := wsPairs(t)
-	for _, role := range []Role{RoleMac, RoleAndroid} {
-		t.Run(string(role), func(t *testing.T) {
-			h := newTestHub()
-			srv, status := pairs()
-			old := newPeer(h, testRoom, role, 8, srv)
-			other := newPeer(h, testRoom, role.Peer(), 8, nil)
-			h.join(old)
-			h.join(other)
-			drain(other)
-
-			repl := newPeer(h, testRoom, role, 8, nil)
-			h.join(repl)
-			if m := decode(t, drain(repl)[0]); m.Type != MsgWelcome || !*m.PeerPresent {
-				t.Fatalf("replacement welcome = %+v", m)
-			}
-			expectStatus(t, status, StatusReplaced)
-
-			// The stale connection's cleanup must not unregister its
-			// replacement or tell the other side anything.
-			h.leave(old)
-			if f := drain(other); len(f) != 0 {
-				t.Fatalf("other side saw %s", dump(f))
-			}
-			h.forward(other, websocket.MessageBinary, []byte("x"))
-			if f := drain(repl); len(f) != 1 || string(f[0].data) != "x" {
-				t.Fatalf("replacement got %s", dump(f))
-			}
-			if s := h.Stats(); s.Rooms != 1 || s.Peers != 2 {
-				t.Fatalf("stats = %+v", s)
-			}
-		})
+	for _, pr := range peers {
+		expectPresenceAgreement(t, pr[0], pr[1])
 	}
 }
 
-func TestFramesDroppedWhilePeerOffline(t *testing.T) {
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+func TestLeaveThenRejoinNotifiesInOrder(t *testing.T) {
+	h := testHub()
+	mac := queuePeer(h, testRoom, RoleMac, 8)
+	oldAndroid := queuePeer(h, testRoom, RoleAndroid, 8)
 	h.join(mac)
-	h.forward(mac, websocket.MessageBinary, []byte("lost"))
-
-	android := newPeer(h, testRoom, RoleAndroid, 8, nil)
-	h.join(android)
-	h.forward(mac, websocket.MessageBinary, []byte("kept"))
-
-	f := drain(android)
-	if len(f) != 2 || decode(t, f[0]).Type != MsgWelcome || string(f[1].data) != "kept" {
-		t.Fatalf("android got %s", dump(f))
-	}
-}
-
-func TestRoomsAreIsolated(t *testing.T) {
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
-	other := newPeer(h, "another-room-0123456789abc", RoleAndroid, 8, nil)
-	h.join(mac)
-	h.join(other)
+	h.join(oldAndroid)
 	drain(mac)
-	drain(other)
 
-	h.forward(other, websocket.MessageBinary, []byte("nope"))
-	if f := drain(mac); len(f) != 0 {
-		t.Fatalf("mac got %s", dump(f))
+	h.leave(oldAndroid)
+	newAndroid := queuePeer(h, testRoom, RoleAndroid, 8)
+	h.join(newAndroid)
+
+	got := drain(mac)
+	if len(got) != 2 {
+		t.Fatalf("mac got %d messages, want peer_left then peer_joined", len(got))
 	}
-	if s := h.Stats(); s.Rooms != 2 || s.Peers != 2 {
-		t.Fatalf("stats = %+v", s)
+	if m := control(t, got[0]); m.Type != MsgPeerLeft || m.Role != RoleAndroid {
+		t.Fatalf("first = %+v", m)
 	}
+	if m := control(t, got[1]); m.Type != MsgPeerJoined || m.Role != RoleAndroid {
+		t.Fatalf("second = %+v", m)
+	}
+	expectWelcome(t, drain(newAndroid)[0], true)
 }
 
-func TestQueueOverflowClosesSlowConsumer(t *testing.T) {
-	srv, status := wsPairs(t)()
-	h := newTestHub()
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
-	android := newPeer(h, testRoom, RoleAndroid, 1, srv)
-	h.join(android) // fills android's one-slot queue with its welcome
-	h.join(mac)     // peer_joined overflows it
+// TestReconnectRaceKeepsPresenceConsistent races an old connection's leave
+// against its replacement's join. Either the replacement wins (no
+// notifications) or the leave wins (peer_left then peer_joined); the mac must
+// never end up believing android is gone while it is connected.
+func TestReconnectRaceKeepsPresenceConsistent(t *testing.T) {
+	sawReplace, sawRejoin := false, false
+	for i := 0; i < 500; i++ {
+		h := testHub()
+		mac := queuePeer(h, testRoom, RoleMac, 8)
+		oldAndroid := inertPeer(h, testRoom, RoleAndroid)
+		h.join(mac)
+		h.join(oldAndroid)
+		drain(mac)
 
-	expectStatus(t, status, StatusSlowConsumer)
+		newAndroid := queuePeer(h, testRoom, RoleAndroid, 8)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; h.leave(oldAndroid) }()
+		go func() { defer wg.Done(); <-start; h.join(newAndroid) }()
+		close(start)
+		wg.Wait()
 
-	// Later frames to the closed peer are discarded without blocking.
-	h.forward(mac, websocket.MessageBinary, []byte("x"))
-	h.leave(android)
-	if f := drain(mac); len(f) != 2 || decode(t, f[1]).Type != MsgPeerLeft {
-		t.Fatalf("mac got %s", dump(f))
+		got := drain(mac)
+		switch len(got) {
+		case 0:
+			sawReplace = true
+		case 2:
+			sawRejoin = true
+			if control(t, got[0]).Type != MsgPeerLeft || control(t, got[1]).Type != MsgPeerJoined {
+				t.Fatalf("notifications out of order: %q then %q", got[0].data, got[1].data)
+			}
+		default:
+			t.Fatalf("mac got %d presence messages", len(got))
+		}
+		if s := h.Stats(); s.Peers != 2 {
+			t.Fatalf("stats = %+v", s)
+		}
 	}
+	t.Logf("replacement won: %v, leave won: %v", sawReplace, sawRejoin)
+}
+
+func TestReplacementIsInvisibleAndDropsOldSender(t *testing.T) {
+	h := testHub()
+	mac := queuePeer(h, testRoom, RoleMac, 8)
+	oldAndroid, oldClient := connPeer(t, h, testRoom, RoleAndroid, 8)
+	h.join(mac)
+	h.join(oldAndroid)
+	drain(mac)
+
+	newAndroid := queuePeer(h, testRoom, RoleAndroid, 8)
+	h.join(newAndroid)
+	expectClosed(t, oldAndroid)
+	expectWelcome(t, drain(newAndroid)[0], true)
+	if got := drain(mac); len(got) != 0 {
+		t.Fatalf("mac saw presence churn: %q", got[0].data)
+	}
+
+	h.forward(oldAndroid, websocket.MessageBinary, []byte("stale"))
+	h.forward(newAndroid, websocket.MessageBinary, []byte("fresh"))
+	got := drain(mac)
+	if len(got) != 1 || string(got[0].data) != "fresh" {
+		t.Fatalf("mac got %d messages, want only the new connection's", len(got))
+	}
+	// The old leave is a no-op now that it no longer owns the role.
+	h.leave(oldAndroid)
+	if got := drain(mac); len(got) != 0 {
+		t.Fatalf("stale leave notified mac: %q", got[0].data)
+	}
+	expectCloseStatus(t, oldClient, StatusReplaced)
+}
+
+func TestQueueOverflowDisconnectsSlowConsumer(t *testing.T) {
+	h := testHub()
+	// The welcome fills mac's single slot, so the next message overflows.
+	mac, macClient := connPeer(t, h, testRoom, RoleMac, 1)
+	h.join(mac)
+	h.join(queuePeer(h, testRoom, RoleAndroid, 8))
+
+	expectClosed(t, mac)
+	expectCloseStatus(t, macClient, StatusSlowConsumer)
 }
 
 // blockingWriter stalls every write after it is armed until released, like a
@@ -340,6 +394,11 @@ type blockingWriter struct {
 	entered chan struct{}
 	once    sync.Once
 	release chan struct{}
+	writes  atomic.Int64 // completed writes
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
 }
 
 func (w *blockingWriter) Write(b []byte) (int, error) {
@@ -347,15 +406,18 @@ func (w *blockingWriter) Write(b []byte) (int, error) {
 		w.once.Do(func() { close(w.entered) })
 		<-w.release
 	}
+	w.writes.Add(1)
 	return len(b), nil
 }
 
+// TestBlockedLoggingDoesNotStallHub checks that the slow-consumer warning is
+// written after the hub lock is released: a stuck log sink must not stop
+// routing or the readiness probe. Ported from the target branch.
 func TestBlockedLoggingDoesNotStallHub(t *testing.T) {
-	w := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	w := newBlockingWriter()
 	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
-	srv, status := wsPairs(t)()
-	android := newPeer(h, testRoom, RoleAndroid, 1, srv)
-	mac := newPeer(h, testRoom, RoleMac, 8, nil)
+	android, androidClient := connPeer(t, h, testRoom, RoleAndroid, 1)
+	mac := queuePeer(h, testRoom, RoleMac, 8)
 	h.join(android) // fills android's one-slot queue with its welcome
 
 	w.armed.Store(true)
@@ -374,8 +436,6 @@ func TestBlockedLoggingDoesNotStallHub(t *testing.T) {
 		t.Fatal("nothing was logged")
 	}
 
-	// With the log sink stuck, the hub must still route and report, and the
-	// slow consumer must already be on its way out.
 	stats := make(chan Stats, 1)
 	go func() { stats <- h.Stats() }()
 	select {
@@ -383,5 +443,421 @@ func TestBlockedLoggingDoesNotStallHub(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("hub lock held while logging")
 	}
-	expectStatus(t, status, StatusSlowConsumer)
+	expectCloseStatus(t, androidClient, StatusSlowConsumer)
+}
+
+func TestForwardDropsWhilePeerOffline(t *testing.T) {
+	h := testHub()
+	mac := queuePeer(h, testRoom, RoleMac, 8)
+	h.join(mac)
+	h.forward(mac, websocket.MessageBinary, []byte("into the void"))
+	if got := drain(mac); len(got) != 1 {
+		t.Fatalf("mac queue has %d messages, want only welcome", len(got))
+	}
+
+	android := queuePeer(h, testRoom, RoleAndroid, 8)
+	h.join(android)
+	if got := drain(android); len(got) != 1 {
+		t.Fatalf("android got %d messages, want only welcome (dropped message replayed?)", len(got))
+	}
+}
+
+// testServer runs a hub behind a real HTTP server, the way the server
+// package does.
+type testServer struct {
+	t   *testing.T
+	url string
+}
+
+func serveHub(t *testing.T, h *Hub) *testServer {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := h.Accept(w, r, nil)
+		if errors.Is(err, ErrDraining) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if err != nil {
+			return
+		}
+		role, _ := ParseRole(r.URL.Query().Get("role"))
+		h.Serve(r.Context(), c, testRoom, role, Options{
+			MaxMessageBytes: 1 << 16,
+			SendQueueSize:   8,
+			WriteTimeout:    time.Second,
+		})
+	}))
+	t.Cleanup(ts.Close)
+	return &testServer{t: t, url: wsURL(ts.URL)}
+}
+
+func (s *testServer) wsURL(role Role) string {
+	return s.url + "?role=" + string(role)
+}
+
+func (s *testServer) dial(role Role) *websocket.Conn {
+	s.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, s.wsURL(role), nil)
+	if err != nil {
+		s.t.Fatalf("dial: %v", err)
+	}
+	s.t.Cleanup(func() { c.CloseNow() })
+	return c
+}
+
+// waitFor polls cond until it holds, failing after 5s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitSessionsEnded fails unless every session admitted by h ends within 2s,
+// well under the WebSocket library's own 5s close-handshake timeout; only a
+// forced socket close can end a stalled handshake that quickly.
+func waitSessionsEnded(t *testing.T, h *Hub) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		h.active.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled session was not force-closed")
+	}
+}
+
+func readOne(t *testing.T, c *websocket.Conn) ControlMessage {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	typ, data, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return control(t, frame{typ: typ, data: data})
+}
+
+// readUntilClose reads c in the background (which also answers the close
+// handshake) and reports the close status it ends with.
+func readUntilClose(c *websocket.Conn) <-chan websocket.StatusCode {
+	ch := make(chan websocket.StatusCode, 1)
+	go func() {
+		for {
+			if _, _, err := c.Read(context.Background()); err != nil {
+				ch <- websocket.CloseStatus(err)
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+func waitStatus(t *testing.T, ch <-chan websocket.StatusCode, want websocket.StatusCode) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("close status = %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection did not close")
+	}
+}
+
+func TestShutdownDrainsSessions(t *testing.T) {
+	h := testHub()
+	srv := serveHub(t, h)
+	mac := srv.dial(RoleMac)
+	readOne(t, mac)
+	android := srv.dial(RoleAndroid)
+	readOne(t, android)
+	readOne(t, mac) // peer_joined
+	macStatus, androidStatus := readUntilClose(mac), readUntilClose(android)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	waitStatus(t, macStatus, websocket.StatusGoingAway)
+	waitStatus(t, androidStatus, websocket.StatusGoingAway)
+	if !h.Draining() {
+		t.Fatal("hub not draining after Shutdown")
+	}
+	if s := h.Stats(); s != (Stats{}) {
+		t.Fatalf("stats after shutdown = %+v", s)
+	}
+
+	// Late arrivals are turned away before the upgrade.
+	_, resp, err := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("late dial: resp = %v, err = %v", resp, err)
+	}
+}
+
+// TestShutdownForceClosesStuckSessions checks that Shutdown waits for a
+// replaced connection that is still in its close handshake, and that the
+// deadline force-closes it.
+func TestShutdownForceClosesStuckSessions(t *testing.T) {
+	h := testHub()
+	srv := serveHub(t, h)
+	oldMac := srv.dial(RoleMac)
+	readOne(t, oldMac) // then never read again, so its close handshake stalls
+	newMac := srv.dial(RoleMac)
+	if m := readOne(t, newMac); m.Type != MsgWelcome {
+		t.Fatalf("new mac got %+v", m)
+	}
+	newStatus := readUntilClose(newMac)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := h.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want deadline exceeded while replaced session is stuck", err)
+	}
+	waitStatus(t, newStatus, websocket.StatusGoingAway)
+	waitSessionsEnded(t, h)
+}
+
+// TestShutdownForceClosesAfterReadLoopExits covers a handshake that nothing
+// else is waiting on: the relay rejects a text message (1008), its read loop
+// exits, and the library's Close waits for a reply the client never sends.
+// Cancelling the session context cannot end that; closing the socket must.
+func TestShutdownForceClosesAfterReadLoopExits(t *testing.T) {
+	h := testHub()
+	srv := serveHub(t, h)
+	c := srv.dial(RoleMac)
+	readOne(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Write(ctx, websocket.MessageText, []byte("not allowed")); err != nil {
+		t.Fatal(err)
+	}
+	// leave runs only after the read loop has returned.
+	waitFor(t, "read loop to exit", func() bool { return h.Stats().Peers == 0 })
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelShutdown()
+	if err := h.Shutdown(shutdownCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want deadline exceeded while the 1008 handshake is stuck", err)
+	}
+	waitSessionsEnded(t, h)
+}
+
+// TestShutdownAwaitsUpgradeInProgress pauses an upgrade right after the hub
+// admitted it and starts shutdown before it reaches Serve. Shutdown must
+// still count the connection, and must kill it once it arrives if the
+// deadline has already passed. The client never reads, so only a forced
+// close can end its session promptly.
+func TestShutdownAwaitsUpgradeInProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		afterDeadline bool
+	}{
+		{"drain begins mid-upgrade", false},
+		{"deadline passes mid-upgrade", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := testHub()
+			admitted, proceed := make(chan struct{}), make(chan struct{})
+			h.testHookAdmitted = func() {
+				close(admitted)
+				<-proceed
+			}
+			srv := serveHub(t, h)
+
+			dialed := make(chan *websocket.Conn, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				c, _, _ := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+				dialed <- c
+			}()
+			<-admitted
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			shutdownErr := make(chan error, 1)
+			go func() { shutdownErr <- h.Shutdown(ctx) }()
+			if tc.afterDeadline {
+				if err := <-shutdownErr; !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown = %v, want deadline exceeded with an upgrade pending", err)
+				}
+			} else {
+				waitFor(t, "drain to begin", h.Draining)
+			}
+
+			close(proceed)
+			if c := <-dialed; c != nil {
+				t.Cleanup(func() { c.CloseNow() })
+			}
+			if !tc.afterDeadline {
+				if err := <-shutdownErr; !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown = %v, want deadline exceeded while the late session is stuck", err)
+				}
+			}
+			waitSessionsEnded(t, h)
+		})
+	}
+}
+
+// TestShutdownClosesUpgradeStalledAfterHijack parks an upgrade after net/http
+// has handed the socket over but before Accept returns, so no session exists
+// yet. At the deadline the socket itself must be closed while the upgrade is
+// still parked, not only once it eventually reaches Serve.
+func TestShutdownClosesUpgradeStalledAfterHijack(t *testing.T) {
+	h := testHub()
+	hijacked, release := make(chan struct{}), make(chan struct{})
+	h.testHookHijacked = func() {
+		close(hijacked)
+		<-release
+	}
+	srv := serveHub(t, h)
+
+	dialed := make(chan *websocket.Conn, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, _, _ := websocket.Dial(ctx, srv.wsURL(RoleMac), nil)
+		dialed <- c
+	}()
+	<-hijacked
+	// net/http flushes the 101 inside Hijack, so the client is connected
+	// even though the server side is still parked in the hook.
+	c := <-dialed
+	if c == nil {
+		close(release)
+		t.Fatal("dial failed")
+	}
+	t.Cleanup(func() { c.CloseNow() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := h.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		close(release)
+		t.Fatalf("Shutdown = %v, want deadline exceeded with an upgrade stalled", err)
+	}
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRead()
+	_, _, err := c.Read(readCtx)
+	stalledOpen := readCtx.Err() != nil
+	close(release)
+	if err == nil || stalledOpen {
+		t.Fatalf("socket stayed open while the upgrade was stalled (err %v)", err)
+	}
+	waitSessionsEnded(t, h)
+}
+
+// rawDial performs the WebSocket upgrade over plain TCP and then does nothing
+// at the WebSocket layer, so it never answers a close handshake. Whether the
+// relay closed the socket is then observable as EOF, independently of any
+// handshake.
+func rawDial(t *testing.T, wsURL string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	req := "GET " + u.RequestURI() + " HTTP/1.1\r\nHost: " + u.Host +
+		"\r\nUpgrade: websocket\r\nConnection: Upgrade" +
+		"\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("upgrade response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d", resp.StatusCode)
+	}
+	return c, br
+}
+
+// expectSocketClosed reads and discards until the relay closes the TCP
+// connection, failing if it is still open after 2s.
+func expectSocketClosed(t *testing.T, c net.Conn, br *bufio.Reader) {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.Copy(io.Discard, br); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("relay did not close the socket")
+	}
+}
+
+// shutdownWithin runs Shutdown with a 200ms deadline and requires it to
+// return context.DeadlineExceeded within 2s.
+func shutdownWithin(t *testing.T, h *Hub) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.Shutdown(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Shutdown = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after its deadline")
+	}
+}
+
+// TestShutdownDeadlineWithBlockedLogging: an established session never
+// answers the close handshake and the log sink is stuck. Shutdown must still
+// close the socket and return at its deadline.
+func TestShutdownDeadlineWithBlockedLogging(t *testing.T) {
+	w := newBlockingWriter()
+	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
+	srv := serveHub(t, h)
+	t.Cleanup(func() { close(w.release) })
+
+	c, br := rawDial(t, srv.wsURL(RoleMac))
+	// The "peer joined" line is the session's only log before it is
+	// established; arm the sink once it has been written.
+	waitFor(t, "join to be logged", func() bool { return w.writes.Load() == 1 })
+	w.armed.Store(true)
+
+	shutdownWithin(t, h)
+	expectSocketClosed(t, c, br)
+}
+
+// TestShutdownDeadlineWithBlockedLoggingDuringUpgrade: as above, but the
+// upgrade is parked after hijacking, so no session exists yet.
+func TestShutdownDeadlineWithBlockedLoggingDuringUpgrade(t *testing.T) {
+	w := newBlockingWriter()
+	w.armed.Store(true)
+	h := NewHub(slog.New(slog.NewTextHandler(w, nil)))
+	hijacked, release := make(chan struct{}), make(chan struct{})
+	h.testHookHijacked = func() {
+		close(hijacked)
+		<-release
+	}
+	srv := serveHub(t, h)
+	t.Cleanup(func() {
+		close(release)
+		close(w.release)
+	})
+
+	c, br := rawDial(t, srv.wsURL(RoleMac))
+	<-hijacked
+
+	shutdownWithin(t, h)
+	expectSocketClosed(t, c, br)
 }

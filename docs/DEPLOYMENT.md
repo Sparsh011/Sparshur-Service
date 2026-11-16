@@ -191,7 +191,8 @@ service restart on boot. Section 5 is the checklist for those.
 
 - **Upgrade:** replace the binary and restart the service. On SIGTERM the
   relay closes every connection with `1001 going away` and exits within
-  `RELAY_SHUTDOWN_TIMEOUT`; clients reconnect to the same room.
+  `RELAY_SHUTDOWN_TIMEOUT`; clients reconnect to the same room. While
+  draining, `/readyz` and new WebSocket upgrades return `503`.
 - **State:** none. Rooms exist only while a peer is connected, so restarts
   and host moves lose nothing. Moving from the mini to a VPS (or back) is a
   DNS/hostname change for clients, not a migration.

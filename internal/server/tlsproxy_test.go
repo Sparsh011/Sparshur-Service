@@ -20,7 +20,7 @@ import (
 // exercises that shape: clients speak https/wss to a reverse proxy whose
 // certificate they verify, and the wire contract must be unchanged.
 func TestWireContractBehindTLSTerminator(t *testing.T) {
-	backend := newTestServer(t)
+	backend, _ := newTestServer(t)
 	target, err := url.Parse(backend.URL)
 	if err != nil {
 		t.Fatal(err)

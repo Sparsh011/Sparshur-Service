@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -44,6 +45,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if s.hub.Draining() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining", "stats": s.hub.Stats()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "stats": s.hub.Stats()})
 }
 
@@ -68,12 +73,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, `role must be "mac" or "android"`)
 		return
 	}
-
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+	// Admission and the drain decision are made atomically inside the hub,
+	// so a connection is either refused here or awaited by shutdown.
+	conn, err := s.hub.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: s.cfg.AllowedOrigins,
 		// Payloads are E2EE ciphertext and do not compress; skip the CPU cost.
 		CompressionMode: websocket.CompressionDisabled,
 	})
+	if errors.Is(err, relay.ErrDraining) {
+		writeError(w, http.StatusServiceUnavailable, "relay shutting down")
+		return
+	}
 	if err != nil {
 		// Accept has already written an HTTP error response.
 		s.log.Debug("websocket accept failed", "err", err)
