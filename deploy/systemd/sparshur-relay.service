@@ -1,0 +1,35 @@
+[Unit]
+Description=Sparshur E2EE WebSocket relay
+Documentation=https://github.com/sparshchadha/sparshur-service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sparshur-relay
+EnvironmentFile=-/etc/sparshur-relay/relay.env
+Restart=on-failure
+RestartSec=2
+# The relay drains for RELAY_SHUTDOWN_TIMEOUT (15s default) on SIGTERM.
+TimeoutStopSec=20
+
+# The relay needs no state, no privileges and no filesystem access.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

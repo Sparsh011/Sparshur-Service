@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sparshur.relay</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/sparshur-relay</string>
+	</array>
+
+	<!-- A dedicated unprivileged account; see docs/DEPLOYMENT.md. It must not
+	     be the account that runs the Sparshur receiver app or owns its
+	     Keychain. -->
+	<key>UserName</key>
+	<string>_sparshurrelay</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Loopback only; tailscale serve or Caddy terminates TLS in front. -->
+		<key>RELAY_ADDR</key>
+		<string>127.0.0.1:8080</string>
+		<key>RELAY_LOG_LEVEL</key>
+		<string>info</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<!-- Must exceed RELAY_SHUTDOWN_TIMEOUT (15s default) so drains finish. -->
+	<key>ExitTimeOut</key>
+	<integer>20</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>StandardOutPath</key>
+	<string>/usr/local/var/log/sparshur-relay/relay.log</string>
+	<key>StandardErrorPath</key>
+	<string>/usr/local/var/log/sparshur-relay/relay.log</string>
+</dict>
+</plist>
