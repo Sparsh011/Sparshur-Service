@@ -15,6 +15,7 @@ import (
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
 	"github.com/sparshchadha/sparshur-service/internal/server"
+	"github.com/sparshchadha/sparshur-service/internal/transfer"
 )
 
 // logQueueSize bounds buffered log lines; beyond it lines are dropped
@@ -52,9 +53,16 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	level.Set(l)
 
 	hub := relay.NewHub(log)
+	broker := transfer.New(log, transfer.Options{
+		Wait:        cfg.TransferWait,
+		IdleTimeout: cfg.TransferIdleTimeout,
+		MaxBytes:    cfg.MaxTransferBytes,
+		MaxActive:   cfg.MaxTransfers,
+	})
+	defer broker.Close()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(cfg, hub, log).Handler(),
+		Handler:           server.New(cfg, hub, broker, log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -76,6 +84,7 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 
 	// Start the deadline before anything else, logging included.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	broker.Close()
 	defer cancel()
 	log.Info("shutting down")
 	// srv.Shutdown closes the listener and drains plain HTTP requests, but

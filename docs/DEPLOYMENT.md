@@ -131,7 +131,11 @@ Linux allow that with `TS_PERMIT_CERT_UID=caddy` in `/etc/default/tailscaled`.
 
 Either way the terminator must pass WebSocket upgrades through (both do by
 default) and must not buffer or idle-timeout long-lived connections below
-the relay's 25 s ping interval.
+the relay's 25 s ping interval. For HTTP file transfers, the proxy must stream
+request and response bodies, disable request-body buffering, and impose no
+body-size cap. Configure any proxy I/O timeouts to accommodate the relay's
+transfer wait and idle settings. The supplied Caddyfile uses
+`flush_interval -1` to flush streamed responses immediately.
 
 ## 4. Lock down ingress
 
@@ -146,8 +150,9 @@ the relay's 25 s ping interval.
 
 `relaycheck` drives the relay exactly as a device pair would: health probes,
 room minting, WebSocket upgrade for both roles, presence messages, binary
-forwarding both ways and `peer_left`. It validates the certificate against
-the system trust store and has no option to skip that.
+forwarding both ways, `peer_left`, and a byte-verified 1 MiB HTTP transfer. It
+validates the certificate against the system trust store and has no option to
+skip that.
 
 On the host, against the plaintext backend:
 
@@ -169,12 +174,12 @@ Expected output ends in `PASS`. Then check the negative cases:
 | Same command with Tailscale disconnected | Fails to connect |
 | `curl http://<public-or-LAN-ip>:8080/healthz` from another machine | Connection refused or timeout |
 | `curl https://<public-ip>/healthz` from outside the tailnet | Connection refused or timeout |
-| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | `{"status":"ok","stats":{...}}` |
+| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | `{"status":"ok","stats":{...},"transfers":0}` |
 | Stop the service, then run `relaycheck` | Fails; the service manager restarts the relay |
 
 `/healthz` is the liveness probe and `/readyz` the readiness probe for any
-uptime monitor; both are unauthenticated and reveal only room and peer
-counts.
+uptime monitor. Both are unauthenticated and reveal room, peer and active
+transfer counts.
 
 ### What is verified where
 
@@ -192,9 +197,12 @@ service restart on boot. Section 5 is the checklist for those.
 - **Upgrade:** replace the binary and restart the service. On SIGTERM the
   relay closes every connection with `1001 going away` and exits within
   `RELAY_SHUTDOWN_TIMEOUT`; clients reconnect to the same room. While
-  draining, `/readyz` and new WebSocket upgrades return `503`.
+  draining, `/readyz`, new WebSocket upgrades and new HTTP transfers return
+  `503`. Waiting transfers wake immediately, while paired transfers drain
+  under the HTTP shutdown deadline.
 - **State:** none. Rooms exist only while a peer is connected, so restarts
   and host moves lose nothing. Moving from the mini to a VPS (or back) is a
   DNS/hostname change for clients, not a migration.
 - **Logs:** JSON lines on stdout. Room IDs are truncated to eight
-  characters; payloads are never logged.
+  characters, and transfer IDs use the same truncation. Completed transfers
+  log byte count and duration. Payloads are never logged.
