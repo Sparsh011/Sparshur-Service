@@ -227,3 +227,96 @@ func TestCreateRoom(t *testing.T) {
 		t.Fatalf("invalid room id %q", body.RoomID)
 	}
 }
+
+func TestSimultaneousConnect(t *testing.T) {
+	ts := newTestServer(t)
+	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/rooms/" + testRoom + "/ws?role=" + string(relay.RoleAndroid)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		c   *websocket.Conn
+		err error
+	}
+	dialed := make(chan result, 1)
+	go func() {
+		c, _, err := websocket.Dial(ctx, url, nil)
+		dialed <- result{c, err}
+	}()
+	mac := dial(t, ts, testRoom, relay.RoleMac)
+	res := <-dialed
+	if res.err != nil {
+		t.Fatalf("dial android: %v", res.err)
+	}
+	android := res.c
+	t.Cleanup(func() { android.CloseNow() })
+
+	// Whatever the arrival order, each side gets its welcome first and ends
+	// up seeing the other: exactly one was first and later gets peer_joined.
+	macWelcome, androidWelcome := readControl(t, mac), readControl(t, android)
+	if macWelcome.Type != relay.MsgWelcome || androidWelcome.Type != relay.MsgWelcome {
+		t.Fatalf("welcomes = %+v, %+v", macWelcome, androidWelcome)
+	}
+	first, joined := mac, relay.RoleAndroid
+	switch {
+	case *macWelcome.PeerPresent && !*androidWelcome.PeerPresent:
+		first, joined = android, relay.RoleMac
+	case !*macWelcome.PeerPresent && *androidWelcome.PeerPresent:
+	default:
+		t.Fatalf("inconsistent presence: mac %+v android %+v", macWelcome, androidWelcome)
+	}
+	if m := readControl(t, first); m.Type != relay.MsgPeerJoined || m.Role != joined {
+		t.Fatalf("first peer got %+v", m)
+	}
+
+	write(t, mac, websocket.MessageBinary, []byte("m"))
+	write(t, android, websocket.MessageBinary, []byte("a"))
+	if _, got := read(t, android); string(got) != "m" {
+		t.Fatalf("android got %q", got)
+	}
+	if _, got := read(t, mac); string(got) != "a" {
+		t.Fatalf("mac got %q", got)
+	}
+}
+
+func TestRejoinAfterDisconnect(t *testing.T) {
+	ts := newTestServer(t)
+	mac, android := pair(t, ts)
+
+	android.Close(websocket.StatusNormalClosure, "")
+	if m := readControl(t, mac); m.Type != relay.MsgPeerLeft || m.Role != relay.RoleAndroid {
+		t.Fatalf("mac got %+v", m)
+	}
+
+	android = dial(t, ts, testRoom, relay.RoleAndroid)
+	if m := readControl(t, android); m.Type != relay.MsgWelcome || !*m.PeerPresent {
+		t.Fatalf("android welcome = %+v", m)
+	}
+	if m := readControl(t, mac); m.Type != relay.MsgPeerJoined || m.Role != relay.RoleAndroid {
+		t.Fatalf("mac got %+v", m)
+	}
+	write(t, mac, websocket.MessageBinary, []byte("again"))
+	if _, got := read(t, android); string(got) != "again" {
+		t.Fatalf("android got %q", got)
+	}
+}
+
+func TestReconnectReplacesOldAndroidConnection(t *testing.T) {
+	ts := newTestServer(t)
+	mac, oldAndroid := pair(t, ts)
+
+	newAndroid := dial(t, ts, testRoom, relay.RoleAndroid)
+	if m := readControl(t, newAndroid); m.Type != relay.MsgWelcome || !*m.PeerPresent {
+		t.Fatalf("new android welcome = %+v", m)
+	}
+	expectClose(t, oldAndroid, relay.StatusReplaced)
+
+	write(t, mac, websocket.MessageBinary, []byte("after reconnect"))
+	if _, got := read(t, newAndroid); string(got) != "after reconnect" {
+		t.Fatalf("new android got %q", got)
+	}
+	// The mac saw no presence churn: its next frame is the android's data.
+	write(t, newAndroid, websocket.MessageBinary, []byte("reply"))
+	if typ, got := read(t, mac); typ != websocket.MessageBinary || string(got) != "reply" {
+		t.Fatalf("mac got %v %q", typ, got)
+	}
+}

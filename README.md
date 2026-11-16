@@ -51,7 +51,7 @@ handshake.
 | `RELAY_ADDR`             | `:8080` | Listen address                               |
 | `RELAY_MAX_MESSAGE_BYTES`| `1048576` | Max size of one frame                      |
 | `RELAY_SEND_QUEUE_SIZE`  | `64`    | Frames buffered per connection               |
-| `RELAY_PING_INTERVAL`    | `25s`   | Keepalive ping interval                      |
+| `RELAY_PING_INTERVAL`    | `25s`   | Keepalive ping interval; `0` disables pings  |
 | `RELAY_WRITE_TIMEOUT`    | `10s`   | Per-write / ping timeout                     |
 | `RELAY_SHUTDOWN_TIMEOUT` | `15s`   | Grace period on SIGTERM                      |
 | `RELAY_ALLOWED_ORIGINS`  | (none)  | Comma-separated Origin host patterns for browser clients; native clients send no Origin and are always allowed |

@@ -23,6 +23,7 @@ type Config struct {
 
 	// PingInterval is how often the relay pings each client to keep NATs and
 	// proxies from timing out idle connections and to detect dead peers.
+	// Zero disables pings.
 	PingInterval time.Duration
 
 	// WriteTimeout bounds a single write (frame or ping) to a client.
@@ -83,6 +84,15 @@ func Load() (Config, error) {
 	}
 	if cfg.SendQueueSize <= 0 {
 		return Config{}, fmt.Errorf("RELAY_SEND_QUEUE_SIZE must be positive")
+	}
+	if cfg.PingInterval < 0 {
+		return Config{}, fmt.Errorf("RELAY_PING_INTERVAL must not be negative (use 0 to disable)")
+	}
+	if cfg.WriteTimeout <= 0 {
+		return Config{}, fmt.Errorf("RELAY_WRITE_TIMEOUT must be positive")
+	}
+	if cfg.ShutdownTimeout <= 0 {
+		return Config{}, fmt.Errorf("RELAY_SHUTDOWN_TIMEOUT must be positive")
 	}
 	return cfg, nil
 }
