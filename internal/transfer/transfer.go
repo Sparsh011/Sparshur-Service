@@ -25,26 +25,36 @@ type Options struct {
 type Broker struct {
 	mu      sync.Mutex
 	entries map[string]*entry
-	closed  chan struct{}
+	closing chan struct{}
+	closed  bool
 	log     *slog.Logger
 	opts    Options
 	buffers sync.Pool
 }
 
 type entry struct {
-	sender, receiver *http.Request
-	receiverW        http.ResponseWriter
-	ready, done      chan struct{}
-	abort            bool // Written by Send before done closes, read by Receive afterwards.
+	sender, receiver bool
+	recvW            http.ResponseWriter
+	recvContext      context.Context
+	declaredLen      int64
+	paired           chan struct{}
+	headersReady     chan error
+	done             chan error
 }
 
+var (
+	errSizeExceeded = errors.New("transfer exceeds byte limit")
+	errSenderRead   = errors.New("sender read failed or timed out")
+	errReceiver     = errors.New("receiver unavailable")
+)
+
 // New creates a broker. Options must have positive Wait, IdleTimeout and MaxActive.
-func New(log *slog.Logger, opts Options) *Broker {
+func New(log *slog.Logger, o Options) *Broker {
 	return &Broker{
 		entries: make(map[string]*entry),
-		closed:  make(chan struct{}),
+		closing: make(chan struct{}),
 		log:     log,
-		opts:    opts,
+		opts:    o,
 		buffers: sync.Pool{New: func() any { return new([256 << 10]byte) }},
 	}
 }
@@ -61,72 +71,93 @@ func (b *Broker) Active() int {
 func (b *Broker) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	select {
-	case <-b.closed:
-		return
-	default:
-		close(b.closed)
-	}
-	for key, e := range b.entries {
-		if e.sender == nil || e.receiver == nil {
-			delete(b.entries, key)
-		}
+	if !b.closed {
+		b.closed = true
+		close(b.closing)
 	}
 }
 
 // Send waits for a receiver, then copies the request body directly to it.
-func (b *Broker) Send(w http.ResponseWriter, r *http.Request, roomID, transferID string) {
-	if b.opts.MaxBytes > 0 && r.ContentLength > b.opts.MaxBytes {
-		w.Header().Set("Connection", "close")
-		writeError(w, http.StatusRequestEntityTooLarge, "transfer exceeds byte limit")
-		return
-	}
-	e, status := b.join(w, r, roomID+"/"+transferID, true)
+func (b *Broker) Send(w http.ResponseWriter, r *http.Request, roomID, id string) {
+	key := roomID + "/" + id
+	e, status := b.join(w, r, key, true)
 	if status != 0 {
 		// Avoid draining an unpaired upload before sending its error response.
 		w.Header().Set("Connection", "close")
 		writeError(w, status, http.StatusText(status))
 		return
 	}
+	if e == nil {
+		return // The waiting client's context was cancelled.
+	}
 
 	started := time.Now()
-	n, status, message := b.copy(w, r, e)
-	e.abort = status != http.StatusOK
+	n, err := b.copy(w, r, e)
+	// Receive may return as soon as done fires, so copy must have finished
+	// using its writer and cleared its deadlines before publishing the result.
+	e.done <- err
 	b.mu.Lock()
-	delete(b.entries, roomID+"/"+transferID)
+	delete(b.entries, key)
 	b.mu.Unlock()
-	close(e.done)
-	b.log.Info("transfer completed", "room", shortID(roomID), "transfer", shortID(transferID),
-		"bytes", n, "duration", time.Since(started), "status", status)
-	if status != http.StatusOK {
-		w.Header().Set("Connection", "close")
-		writeError(w, status, message)
+
+	fields := []any{"room", shortID(roomID), "transfer", shortID(id),
+		"bytes", n, "duration", time.Since(started)}
+	if err == nil {
+		b.log.Info("transfer completed", fields...)
+		writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
+	b.log.Debug("transfer failed", append(fields, "err", err)...)
+	w.Header().Set("Connection", "close")
+	switch {
+	case errors.Is(err, errSizeExceeded):
+		writeError(w, http.StatusRequestEntityTooLarge, errSizeExceeded.Error())
+	case errors.Is(err, errReceiver):
+		writeError(w, http.StatusBadGateway, errReceiver.Error())
+	default:
+		// Returning without writing would make net/http emit an implicit 200.
+		// Abort the upload response to preserve failure for the sender as well.
+		panic(http.ErrAbortHandler)
+	}
 }
 
-// Receive waits until Send finishes using its ResponseWriter. A failed copy
-// aborts the HTTP stream so an incomplete chunked body cannot appear complete.
-func (b *Broker) Receive(w http.ResponseWriter, r *http.Request, roomID, transferID string) {
-	e, status := b.join(w, r, roomID+"/"+transferID, false)
+// Receive writes and flushes the response headers, then keeps its writer alive
+// until Send finishes. Failed copies abort the stream instead of ending cleanly.
+func (b *Broker) Receive(w http.ResponseWriter, r *http.Request, roomID, id string) {
+	e, status := b.join(w, r, roomID+"/"+id, false)
 	if status != 0 {
 		writeError(w, status, http.StatusText(status))
 		return
 	}
-	<-e.done
-	if e.abort {
+	if e == nil {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if e.declaredLen >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(e.declaredLen, 10))
+	}
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Now().Add(b.opts.IdleTimeout))
+	w.WriteHeader(http.StatusOK)
+	// The sender waits for this flush before touching the receiver's writer.
+	e.headersReady <- controller.Flush()
+	if err := <-e.done; err != nil {
 		panic(http.ErrAbortHandler)
 	}
 }
 
 func (b *Broker) join(w http.ResponseWriter, r *http.Request, key string, sender bool) (*entry, int) {
 	b.mu.Lock()
-	select {
-	case <-b.closed:
+	if b.closed {
 		b.mu.Unlock()
 		return nil, http.StatusServiceUnavailable
-	default:
+	}
+	if sender && b.opts.MaxBytes > 0 && r.ContentLength > b.opts.MaxBytes {
+		b.mu.Unlock()
+		return nil, http.StatusRequestEntityTooLarge
 	}
 	e := b.entries[key]
 	if e == nil {
@@ -134,20 +165,25 @@ func (b *Broker) join(w http.ResponseWriter, r *http.Request, key string, sender
 			b.mu.Unlock()
 			return nil, http.StatusServiceUnavailable
 		}
-		e = &entry{ready: make(chan struct{}), done: make(chan struct{})}
+		e = &entry{
+			declaredLen:  -1,
+			paired:       make(chan struct{}),
+			headersReady: make(chan error, 1),
+			done:         make(chan error, 1),
+		}
 		b.entries[key] = e
 	}
-	if (sender && e.sender != nil) || (!sender && e.receiver != nil) {
+	if (sender && e.sender) || (!sender && e.receiver) {
 		b.mu.Unlock()
 		return nil, http.StatusConflict
 	}
 	if sender {
-		e.sender = r
+		e.sender, e.declaredLen = true, r.ContentLength
 	} else {
-		e.receiver, e.receiverW = r, w
+		e.receiver, e.recvW, e.recvContext = true, w, r.Context()
 	}
-	if e.sender != nil && e.receiver != nil {
-		close(e.ready)
+	if e.sender && e.receiver {
+		close(e.paired)
 	}
 	b.mu.Unlock()
 
@@ -155,12 +191,12 @@ func (b *Broker) join(w http.ResponseWriter, r *http.Request, key string, sender
 	defer timer.Stop()
 	status := http.StatusGatewayTimeout
 	select {
-	case <-e.ready:
+	case <-e.paired:
 		return e, 0
 	case <-timer.C:
 	case <-r.Context().Done():
-		status = http.StatusRequestTimeout
-	case <-b.closed:
+		status = 0
+	case <-b.closing:
 		status = http.StatusServiceUnavailable
 	}
 
@@ -168,7 +204,7 @@ func (b *Broker) join(w http.ResponseWriter, r *http.Request, key string, sender
 	defer b.mu.Unlock()
 	// Pairing wins a simultaneous timeout, cancellation or shutdown. Once
 	// paired, Send owns completion and Receive must keep its writer alive.
-	if e.sender != nil && e.receiver != nil {
+	if e.sender && e.receiver {
 		return e, 0
 	}
 	if b.entries[key] == e {
@@ -177,43 +213,33 @@ func (b *Broker) join(w http.ResponseWriter, r *http.Request, key string, sender
 	return nil, status
 }
 
-func (b *Broker) copy(senderW http.ResponseWriter, r *http.Request, e *entry) (int64, int, string) {
-	sender := http.NewResponseController(senderW)
-	receiver := http.NewResponseController(e.receiverW)
+func (b *Broker) copy(senderW http.ResponseWriter, r *http.Request, e *entry) (int64, error) {
+	rc := http.NewResponseController(senderW)
+	wc := http.NewResponseController(e.recvW)
 	// A disconnected receiver must also interrupt an idle upload read.
 	interrupted := make(chan struct{})
-	stop := context.AfterFunc(e.receiver.Context(), func() {
-		_ = sender.SetReadDeadline(time.Now())
+	stop := context.AfterFunc(e.recvContext, func() {
+		_ = rc.SetReadDeadline(time.Now())
 		close(interrupted)
 	})
 	defer func() {
 		if !stop() {
 			<-interrupted
 		}
-		_ = sender.SetReadDeadline(time.Time{})
-		_ = receiver.SetWriteDeadline(time.Time{})
+		_ = rc.SetReadDeadline(time.Time{})
+		_ = wc.SetWriteDeadline(time.Time{})
 	}()
-
-	w := e.receiverW
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if r.ContentLength >= 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(r.ContentLength, 10))
-	}
-	_ = receiver.SetWriteDeadline(time.Now().Add(b.opts.IdleTimeout))
-	w.WriteHeader(http.StatusOK)
-	if err := receiver.Flush(); err != nil {
-		return 0, http.StatusBadGateway, "receiver unavailable"
+	if err := <-e.headersReady; err != nil {
+		return 0, errors.Join(errReceiver, err)
 	}
 
 	buffer := b.buffers.Get().(*[256 << 10]byte)
 	defer b.buffers.Put(buffer)
 	var total int64
 	for {
-		_ = sender.SetReadDeadline(time.Now().Add(b.opts.IdleTimeout))
-		if e.receiver.Context().Err() != nil {
-			return total, http.StatusBadGateway, "receiver disconnected"
+		_ = rc.SetReadDeadline(time.Now().Add(b.opts.IdleTimeout))
+		if e.recvContext.Err() != nil {
+			return total, errReceiver
 		}
 		chunk := buffer[:]
 		// Read one extra byte to detect an oversized unknown-length body,
@@ -223,27 +249,30 @@ func (b *Broker) copy(senderW http.ResponseWriter, r *http.Request, e *entry) (i
 		}
 		n, readErr := r.Body.Read(chunk)
 		if b.opts.MaxBytes > 0 && int64(n) > b.opts.MaxBytes-total {
-			return total, http.StatusRequestEntityTooLarge, "transfer exceeds byte limit"
+			return total, errSizeExceeded
 		}
 		if n > 0 {
-			_ = receiver.SetWriteDeadline(time.Now().Add(b.opts.IdleTimeout))
-			written, err := w.Write(chunk[:n])
+			_ = wc.SetWriteDeadline(time.Now().Add(b.opts.IdleTimeout))
+			written, err := e.recvW.Write(chunk[:n])
 			total += int64(written)
 			if err != nil || written != n {
-				return total, http.StatusBadGateway, "receiver write failed"
+				return total, errors.Join(errReceiver, err, io.ErrShortWrite)
 			}
-			if err := receiver.Flush(); err != nil {
-				return total, http.StatusBadGateway, "receiver write failed"
+			if err := wc.Flush(); err != nil {
+				return total, errors.Join(errReceiver, err)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
-			return total, http.StatusOK, ""
+			if e.declaredLen >= 0 && total != e.declaredLen {
+				return total, errors.Join(errSenderRead, io.ErrUnexpectedEOF)
+			}
+			return total, nil
 		}
 		if readErr != nil {
-			if e.receiver.Context().Err() != nil {
-				return total, http.StatusBadGateway, "receiver disconnected"
+			if e.recvContext.Err() != nil {
+				return total, errReceiver
 			}
-			return total, http.StatusRequestTimeout, "sender read failed or timed out"
+			return total, errors.Join(errSenderRead, readErr)
 		}
 	}
 }

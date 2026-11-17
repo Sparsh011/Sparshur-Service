@@ -132,9 +132,9 @@ Linux allow that with `TS_PERMIT_CERT_UID=caddy` in `/etc/default/tailscaled`.
 Either way the terminator must pass WebSocket upgrades through (both do by
 default) and must not buffer or idle-timeout long-lived connections below
 the relay's 25 s ping interval. For HTTP file transfers, the proxy must stream
-request and response bodies, disable request-body buffering, and impose no
-body-size cap. Configure any proxy I/O timeouts to accommodate the relay's
-transfer wait and idle settings. The supplied Caddyfile uses
+request and response bodies, disable buffering for both, and impose no
+body-size cap. `tailscale serve` streams bodies directly. Configure any proxy
+I/O timeouts to accommodate the relay's transfer wait and idle settings. The supplied Caddyfile uses
 `flush_interval -1` to flush streamed responses immediately.
 
 ## 4. Lock down ingress

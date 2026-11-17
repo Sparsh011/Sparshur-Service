@@ -35,6 +35,11 @@ func TestLoadDeploymentDefaults(t *testing.T) {
 	if cfg.PingInterval != 25*time.Second || cfg.WriteTimeout != 10*time.Second || cfg.ShutdownTimeout != 15*time.Second {
 		t.Errorf("timers = %v/%v/%v", cfg.PingInterval, cfg.WriteTimeout, cfg.ShutdownTimeout)
 	}
+	if cfg.TransferWait != 60*time.Second || cfg.TransferIdleTimeout != 30*time.Second ||
+		cfg.MaxTransferBytes != 0 || cfg.MaxTransfers != 16 {
+		t.Errorf("transfer defaults = %v/%v/%d/%d, want 60s/30s/0/16",
+			cfg.TransferWait, cfg.TransferIdleTimeout, cfg.MaxTransferBytes, cfg.MaxTransfers)
+	}
 	if len(cfg.AllowedOrigins) != 0 || cfg.LogLevel != "info" {
 		t.Errorf("origins/log level = %v/%q", cfg.AllowedOrigins, cfg.LogLevel)
 	}

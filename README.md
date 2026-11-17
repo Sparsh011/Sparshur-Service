@@ -61,15 +61,16 @@ handshake.
 
 The sender chooses a cryptographically random transfer ID of 22–128 base64url
 characters (`^[A-Za-z0-9_-]{22,128}$`). It sends an encrypted offer over the
-room WebSocket carrying the transfer ID, file name, MIME type, size and key.
-The recipient starts a `GET` and the sender starts a `PUT` on the same transfer
+room WebSocket carrying the transfer ID, file name, MIME type, size and a
+per-transfer key. The recipient starts a `GET` and the sender starts a `PUT` on the same transfer
 path. Either side can arrive first and waits up to `RELAY_TRANSFER_WAIT` for
 its peer. A transfer ID allows one sender and one receiver at a time.
 
 The upload body contains client-encrypted chunks with an authenticated final
 chunk. Clients must verify that final chunk before accepting or saving a
 complete file. Type detection happens on the sending or receiving device.
-The relay forwards ciphertext and never inspects the type, name or key.
+The relay forwards ciphertext without storing files or inspecting content or
+type. Names, MIME types and keys stay inside the encrypted offer.
 
 The receiver gets `application/octet-stream`, with the upload's declared
 `Content-Length` when present. Unknown lengths stream with HTTP framing.
@@ -82,11 +83,20 @@ A successful `PUT` returns `200 {"bytes":N}` once the relay has delivered the
 bytes. The peer confirms acceptance over the encrypted WebSocket after
 verification. A broken or stalled upload aborts the download stream. Clients
 must treat a truncated body or missing authenticated final chunk as failure.
-Duplicate senders or receivers get `409`, rendezvous timeouts get `504`,
-oversized uploads get `413`, and capacity or shutdown rejection gets `503`.
-A failed receiver causes `502` on the upload or a connection error. Each
-read and write has the `RELAY_TRANSFER_IDLE_TIMEOUT` idle deadline. On
-shutdown, waiting transfers receive `503` and paired transfers have the
+The transfer endpoints use these status codes.
+
+| Status | Meaning |
+|--------|---------|
+| `200` | The relay delivered the encrypted bytes to the receiver |
+| `400` | Invalid room or transfer ID |
+| `409` | A sender or receiver already occupies that slot |
+| `413` | Declared or streamed bytes exceed the configured limit |
+| `502` | The receiver disconnected or failed during a write |
+| `503` | Transfer capacity reached or the relay is shutting down |
+| `504` | The peer did not arrive before the rendezvous deadline |
+
+A sender read failure or idle timeout aborts both HTTP streams. Each read and
+write has the `RELAY_TRANSFER_IDLE_TIMEOUT` idle deadline. On shutdown, waiting transfers receive `503` and paired transfers have the
 HTTP server's shutdown grace period to finish.
 
 The current Android and Mac apps still need to adopt this contract, stream

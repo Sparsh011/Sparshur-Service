@@ -237,55 +237,57 @@ func checkTransfer(ctx context.Context, client *http.Client, base, roomID string
 		return err
 	}
 	target := base + "/v1/rooms/" + roomID + "/transfers/" + transferID
-	put, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	put.Header.Set("Content-Type", "application/octet-stream")
-	upload := make(chan error, 1)
-	go func() {
-		resp, err := client.Do(put)
-		if err != nil {
-			upload <- err
-			cancel()
-			return
-		}
-		defer resp.Body.Close()
-		var receipt struct {
-			Bytes int64 `json:"bytes"`
-		}
-		if resp.StatusCode != http.StatusOK {
-			err = fmt.Errorf("transfer PUT status = %d", resp.StatusCode)
-		} else if err = json.NewDecoder(resp.Body).Decode(&receipt); err == nil && receipt.Bytes != int64(len(payload)) {
-			err = fmt.Errorf("transfer PUT receipt bytes = %d, want %d", receipt.Bytes, len(payload))
-		}
-		upload <- err
-		if err != nil {
-			cancel()
-		}
-	}()
 	get, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := client.Do(get)
+	download := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(get)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("status = %d", resp.StatusCode)
+			} else {
+				var got []byte
+				got, err = io.ReadAll(io.LimitReader(resp.Body, int64(len(payload))+1))
+				if err == nil && !bytes.Equal(got, payload) {
+					err = errors.New("body was altered or truncated")
+				}
+			}
+		}
+		download <- err
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	put, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("transfer GET: %w", err)
+		return err
+	}
+	put.ContentLength = int64(len(payload))
+	put.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := client.Do(put)
+	if err != nil {
+		return fmt.Errorf("transfer PUT: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("transfer GET status = %d", resp.StatusCode)
+		return fmt.Errorf("transfer PUT status = %d", resp.StatusCode)
 	}
-	got, err := io.ReadAll(io.LimitReader(resp.Body, int64(len(payload))+1))
-	if err != nil {
-		return fmt.Errorf("transfer GET body: %w", err)
+	var receipt struct {
+		Bytes int64 `json:"bytes"`
 	}
-	if !bytes.Equal(got, payload) {
-		return errors.New("transfer body was altered or truncated")
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&receipt); err != nil {
+		return fmt.Errorf("transfer PUT receipt: %w", err)
 	}
-	if err := <-upload; err != nil {
-		return fmt.Errorf("transfer PUT: %w", err)
+	if receipt.Bytes != int64(len(payload)) {
+		return fmt.Errorf("transfer PUT receipt bytes = %d, want %d", receipt.Bytes, len(payload))
 	}
-	fmt.Println("ok    1 MiB streaming PUT/GET transfer forwarded verbatim")
+	if err := <-download; err != nil {
+		return fmt.Errorf("transfer GET: %w", err)
+	}
+	fmt.Println("ok    streaming transfer PUT/GET (1 MiB)")
 	return nil
 }
