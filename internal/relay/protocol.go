@@ -76,6 +76,11 @@ func ValidRoomID(id string) bool {
 	return roomIDPattern.MatchString(id)
 }
 
+// ValidTransferID reports whether id is an acceptable transfer identifier.
+func ValidTransferID(id string) bool {
+	return roomIDPattern.MatchString(id)
+}
+
 // NewRoomID returns a random 256-bit room identifier, base64url encoded.
 func NewRoomID() (string, error) {
 	b := make([]byte, 32)

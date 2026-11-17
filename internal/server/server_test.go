@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
+	"github.com/sparshchadha/sparshur-service/internal/transfer"
 )
 
 const testRoom = "test-room-0123456789abcdef"
@@ -33,10 +35,12 @@ func newTestServer(t *testing.T, opts ...func(*config.Config)) (*httptest.Server
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	hub := relay.NewHub(log)
-	ts := httptest.NewServer(New(cfg, hub, log).Handler())
+	broker := transfer.New(log, transfer.Options{Wait: time.Second, IdleTimeout: time.Second, MaxActive: 16})
+	ts := httptest.NewServer(New(cfg, hub, broker, log).Handler())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		broker.Close()
 		_ = hub.Shutdown(ctx)
 		ts.Close()
 	})
@@ -494,5 +498,112 @@ func TestReconnectReplacesOldAndroidConnection(t *testing.T) {
 	write(t, newAndroid, websocket.MessageBinary, []byte("reply"))
 	if typ, got := read(t, mac); typ != websocket.MessageBinary || string(got) != "reply" {
 		t.Fatalf("mac got %v %q", typ, got)
+	}
+}
+
+func TestTransferRouting(t *testing.T) {
+	ts, hub := newTestServer(t)
+	path := "/v1/rooms/" + testRoom + "/transfers/transfer-0123456789abcdef"
+	put, err := http.NewRequest(http.MethodPut, ts.URL+path, strings.NewReader("opaque encrypted bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload := make(chan error, 1)
+	go func() {
+		resp, err := ts.Client().Do(put)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("PUT status = %d", resp.StatusCode)
+			}
+		}
+		upload <- err
+	}()
+	resp, err := ts.Client().Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || string(body) != "opaque encrypted bytes" {
+		t.Fatalf("GET status = %d, body = %q: %v", resp.StatusCode, body, err)
+	}
+	if err := <-upload; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, method := range []string{http.MethodPut, http.MethodGet} {
+		for _, invalid := range []string{
+			"/v1/rooms/short/transfers/transfer-0123456789abcdef",
+			"/v1/rooms/" + testRoom + "/transfers/short",
+			"/v1/rooms/" + testRoom + "/transfers/invalid!0123456789abcdef",
+			"/v1/rooms/" + testRoom + "/transfers/" + strings.Repeat("a", 129),
+		} {
+			req, _ := http.NewRequest(method, ts.URL+invalid, nil)
+			resp, err := ts.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s %s status = %d", method, invalid, resp.StatusCode)
+			}
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := hub.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{http.MethodPut, http.MethodGet} {
+		req, _ := http.NewRequest(method, ts.URL+path, nil)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("draining %s status = %d", method, resp.StatusCode)
+		}
+	}
+}
+
+func TestReadyIncludesTransfers(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	hub := relay.NewHub(log)
+	broker := transfer.New(log, transfer.Options{Wait: time.Second, IdleTimeout: time.Second, MaxActive: 16})
+	defer broker.Close()
+	s := New(config.Config{}, hub, broker, log)
+	waiting := make(chan struct{})
+	go func() {
+		defer close(waiting)
+		broker.Receive(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), testRoom, "transfer-0123456789abcdef")
+	}()
+	deadline := time.Now().Add(time.Second)
+	for broker.Active() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("receiver did not enter broker")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, draining := range []bool{false, true} {
+		wantStatus, wantTransfers := http.StatusOK, float64(1)
+		if draining {
+			if err := hub.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			broker.Close()
+			<-waiting
+			wantStatus, wantTransfers = http.StatusServiceUnavailable, 0
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if w.Code != wantStatus || body["transfers"] != wantTransfers {
+			t.Fatalf("ready status = %d, body = %v", w.Code, body)
+		}
 	}
 }
