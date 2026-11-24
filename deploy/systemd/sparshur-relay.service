@@ -7,13 +7,15 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/sparshur-relay
 EnvironmentFile=-/etc/sparshur-relay/relay.env
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 # The relay drains for RELAY_SHUTDOWN_TIMEOUT (15s default) on SIGTERM.
 TimeoutStopSec=20
 
-# The relay needs no state, no privileges and no filesystem access.
-DynamicUser=yes
+# The daemon reads the enrollment file during startup and reload.
+User=sparshur-relay
+ReadOnlyPaths=-/etc/sparshur-relay
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

@@ -3,10 +3,13 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sparshchadha/sparshur-service/internal/bridge"
 )
 
 // Config holds all runtime settings for the relay.
@@ -41,18 +44,25 @@ type Config struct {
 
 	// LogLevel is one of debug, info, warn, error.
 	LogLevel string
+
+	RelayPublicURL      string
+	RelayID             string
+	RelayEnrollmentFile string
 }
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:            getenv("RELAY_ADDR", ":8080"),
-		MaxMessageBytes: 1 << 20,
-		SendQueueSize:   64,
-		PingInterval:    25 * time.Second,
-		WriteTimeout:    10 * time.Second,
-		ShutdownTimeout: 15 * time.Second,
-		LogLevel:        getenv("RELAY_LOG_LEVEL", "info"),
+		Addr:                getenv("RELAY_ADDR", ":8080"),
+		MaxMessageBytes:     1 << 20,
+		SendQueueSize:       64,
+		PingInterval:        25 * time.Second,
+		WriteTimeout:        10 * time.Second,
+		ShutdownTimeout:     15 * time.Second,
+		LogLevel:            getenv("RELAY_LOG_LEVEL", "info"),
+		RelayPublicURL:      os.Getenv("RELAY_PUBLIC_URL"),
+		RelayID:             os.Getenv("RELAY_ID"),
+		RelayEnrollmentFile: os.Getenv("RELAY_ENROLLMENT_FILE"),
 	}
 
 	var err error
@@ -97,6 +107,9 @@ func Load() (Config, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("RELAY_SHUTDOWN_TIMEOUT must be positive")
 	}
+	if err := cfg.validateBridge(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -129,4 +142,30 @@ func durationEnv(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return d, nil
+}
+
+func (cfg Config) validateBridge() error {
+	if cfg.RelayPublicURL == "" && cfg.RelayID == "" && cfg.RelayEnrollmentFile == "" {
+		return nil
+	}
+	if cfg.RelayPublicURL == "" || cfg.RelayID == "" || cfg.RelayEnrollmentFile == "" {
+		return fmt.Errorf("set RELAY_PUBLIC_URL, RELAY_ID and RELAY_ENROLLMENT_FILE together")
+	}
+	raw := cfg.RelayPublicURL
+	u, err := url.Parse(raw)
+	if err != nil || len(raw) > 2048 || strings.ContainsAny(raw, "|#") || u.Scheme != "wss" ||
+		u.Hostname() == "" || u.Hostname() != strings.ToLower(u.Hostname()) || u.User != nil ||
+		u.ForceQuery || u.RawQuery != "" || u.EscapedPath() != bridge.Path || u.String() != raw {
+		return fmt.Errorf("RELAY_PUBLIC_URL must be a canonical wss URL at /v1/relay")
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid RELAY_PUBLIC_URL port")
+		}
+	}
+	if !bridge.ValidRelayID(cfg.RelayID) {
+		return fmt.Errorf("RELAY_ID must be 1–128 printable ASCII characters excluding | and spaces")
+	}
+	return nil
 }

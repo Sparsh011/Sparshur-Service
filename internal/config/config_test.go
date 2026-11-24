@@ -90,3 +90,42 @@ func TestLoadValidatesConnectionSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestBridgeConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, url, id, enrollment string
+		valid                     bool
+	}{
+		{"disabled", "", "", "", true},
+		{"enabled", "wss://relay.example/v1/relay", "mini", "/etc/relay.json", true},
+		{"explicit port", "wss://[::1]:443/v1/relay", "mini", "relay.json", true},
+		{"partial", "wss://relay.example/v1/relay", "", "relay.json", false},
+		{"uppercase host", "wss://Relay.example/v1/relay", "mini", "relay.json", false},
+		{"plaintext", "ws://relay.example/v1/relay", "mini", "relay.json", false},
+		{"userinfo", "wss://@relay.example/v1/relay", "mini", "relay.json", false},
+		{"query", "wss://relay.example/v1/relay?", "mini", "relay.json", false},
+		{"fragment", "wss://relay.example/v1/relay#", "mini", "relay.json", false},
+		{"escaped path", "wss://relay.example/v1/%72elay", "mini", "relay.json", false},
+		{"wrong path", "wss://relay.example/v1/relay/", "mini", "relay.json", false},
+		{"URL delimiter", "wss://rel|ay.example/v1/relay", "mini", "relay.json", false},
+		{"URL length", "wss://" + strings.Repeat("a", 2048) + "/v1/relay", "mini", "relay.json", false},
+		{"bad port", "wss://relay.example:0/v1/relay", "mini", "relay.json", false},
+		{"ID delimiter", "wss://relay.example/v1/relay", "mini|test", "relay.json", false},
+		{"ID whitespace", "wss://relay.example/v1/relay", " mini", "relay.json", false},
+		{"ID length", "wss://relay.example/v1/relay", strings.Repeat("a", 129), "relay.json", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("RELAY_PUBLIC_URL", tc.url)
+			t.Setenv("RELAY_ID", tc.id)
+			t.Setenv("RELAY_ENROLLMENT_FILE", tc.enrollment)
+			got, err := Load()
+			if (err == nil) != tc.valid {
+				t.Fatalf("Load returned %v, expected validity %v", err, tc.valid)
+			}
+			if tc.valid && (got.RelayPublicURL != tc.url || got.RelayID != tc.id || got.RelayEnrollmentFile != tc.enrollment) {
+				t.Fatal("configuration did not preserve exact values")
+			}
+		})
+	}
+}

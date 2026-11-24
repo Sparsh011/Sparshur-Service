@@ -1,30 +1,14 @@
 # Deploying the relay on a private VPN
 
-The relay is one static Go binary with no state, no config file and no
-privileges. The same binary and the same wire contract (see the
-[README](../README.md)) run on a Linux VPS or a Mac mini. This guide covers a
+The relay runs as an unprivileged Go service on Linux or a Mac mini. See the
+[README](../README.md) for configuration, enrollment and the wire contract. This guide covers a
 private deployment where the relay is reachable only over a VPN (Tailscale
 here; WireGuard works the same way) and TLS is terminated by a trusted proxy
 on the same host.
 
-Nothing in this guide changes relay behaviour. It uses the existing
-`RELAY_ADDR` setting and the existing routes, room semantics and health
-checks.
-
-## Where the relay fits
-
-| Milestone | Transport | Uses this relay? |
-|-----------|-----------|------------------|
-| First cross-network milestone | Android talks straight to the Mac's paired-v2 receiver (port 8787) over the tailnet | No |
-| Later hosted transport | Both devices dial out to this relay over `wss://` | Yes |
-
-The relay stays independently deployable so it can be stood up, checked and
-left running before any client depends on it. Deploying it does not affect
-paired-v2, and paired-v2 does not need it.
-
-The clients' relay transport is not yet this relay's wire contract (different
-path, subprotocol and framing), so a deployed relay is verified with
-`relaycheck` below, not with the apps.
+Android and macOS connect to the authenticated `/v1/relay` endpoint over
+WSS. Paired-v2 local HTTP uses port 8787 on the receiving Mac for the local
+and direct private-VPN lessons.
 
 ## Topology
 
@@ -42,9 +26,8 @@ device ──wss://relay-host.<tailnet>.ts.net──▶ TLS terminator ──htt
   with the normal system trust store. No custom CA, no pinning bypass.
 - Tailnet ACLs decide which devices can reach the terminator.
 
-Joining the tailnet is network reachability, not authentication. A room ID
-is still a secret capability and peers still authenticate each other inside
-the E2EE handshake.
+Tailnet ACLs control network access. The relay separately authenticates both
+devices against its enrollment file.
 
 ### Why not bind the relay to the tailnet address directly?
 
@@ -57,26 +40,66 @@ service managers below restart it until it does.
 ## 1. Build and install the binary
 
 ```sh
-make dist    # dist/relay-{linux-amd64,linux-arm64,darwin-arm64,darwin-amd64}
+make dist    # dist/{relay,relayctl}-{linux-amd64,linux-arm64,darwin-arm64,darwin-amd64}
 ```
 
 Copy the matching file to the host as `/usr/local/bin/sparshur-relay`
-(mode `0755`, owned by root).
+(mode `0755`, owned by root). Install the matching `relayctl` as
+`/usr/local/bin/relayctl`.
 
-## 2. Run it as a service
+## 2. Configure device enrollment
+
+Copy the device ID and Base64 Ed25519 public key from Mac Settings →
+Diagnostics → Public enrollment details and Android debug Settings → Mac
+mini relay. Run the `relayctl` commands in the [README](../README.md) in a
+private admin directory, with the two real public keys and a fresh lowercase
+UUID for the route. This enrollment registers the devices for transport
+authentication and routing. Encrypted messaging will use its own pairing
+upgrade.
+
+Set the three environment variables as follows, using your actual hostname
+and a stable relay ID.
+
+```text
+RELAY_PUBLIC_URL=wss://relay-host.<tailnet>.ts.net/v1/relay
+RELAY_ID=home-mini
+RELAY_ENROLLMENT_FILE=/etc/sparshur-relay/enrollment.json
+```
+
+Use the same exact URL and ID, including any explicit port, as
+`SPARSHUR_RELAY_URL` / `SPARSHUR_RELAY_ID` on the Mac and in the WSS URL /
+Relay ID fields on Android.
+
+Keep the deployed copy in a root-owned directory. Publish a replacement
+atomically and give the relay account read access. Substitute
+`_sparshurrelay` on macOS and `sparshur-relay` on Linux.
+
+```sh
+sudo install -d -m 0755 /etc/sparshur-relay
+sudo install -m 0400 -o "$RELAY_USER" ./enrollment.json /etc/sparshur-relay/enrollment.json.new
+sudo mv /etc/sparshur-relay/enrollment.json.new /etc/sparshur-relay/enrollment.json
+```
+
+After later changes, publish the replacement and send SIGHUP using
+`sudo launchctl kill SIGHUP system/com.sparshur.relay` on macOS or
+`sudo systemctl reload sparshur-relay` on Linux.
+
+## 3. Run it as a service
 
 ### Linux VPS (systemd)
 
 ```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin sparshur-relay
 sudo install -m 0755 relay-linux-amd64 /usr/local/bin/sparshur-relay
 sudo install -D -m 0644 deploy/relay.env.example /etc/sparshur-relay/relay.env
 sudo install -m 0644 deploy/systemd/sparshur-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now sparshur-relay
 ```
 
-The unit runs as a throwaway `DynamicUser` with a read-only filesystem. Logs
-are JSON on stdout: `journalctl -u sparshur-relay`.
+Set the authenticated relay variables in `/etc/sparshur-relay/relay.env` and
+publish the enrollment file after creating the service user. Start the unit
+with `sudo systemctl enable --now sparshur-relay`. The enrollment directory is
+read-only in the unit. Read JSON logs with `journalctl -u sparshur-relay`.
 
 ### Mac mini (launchd)
 
@@ -89,11 +112,13 @@ sudo sysadminctl -addUser _sparshurrelay -shell /usr/bin/false -home /var/empty
 sudo install -m 0755 relay-darwin-arm64 /usr/local/bin/sparshur-relay
 sudo install -d -o _sparshurrelay /usr/local/var/log/sparshur-relay
 sudo install -m 0644 -o root -g wheel deploy/launchd/com.sparshur.relay.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.sparshur.relay.plist
 ```
 
 launchd does not read env files; edit `EnvironmentVariables` in the plist to
-change settings, then `sudo launchctl kickstart -k system/com.sparshur.relay`.
+set the authenticated relay variables. Publish the enrollment after creating
+`_sparshurrelay`, then run
+`sudo launchctl bootstrap system /Library/LaunchDaemons/com.sparshur.relay.plist`.
+After editing environment variables, boot out and bootstrap the job again.
 Set the mini to never sleep and to restart after power loss
 (`sudo pmset -a sleep 0 autorestart 1`).
 
@@ -106,7 +131,7 @@ is correct.
 docker run -d --restart unless-stopped -p 127.0.0.1:8080:8080 sparshur-relay
 ```
 
-## 3. Terminate TLS on the tailnet
+## 4. Terminate TLS on the tailnet
 
 Enable MagicDNS and HTTPS certificates for the tailnet in the Tailscale
 admin console first. Pick one terminator.
@@ -118,7 +143,8 @@ tailscale serve --bg --https=443 http://127.0.0.1:8080
 tailscale serve status
 ```
 
-This serves `https://relay-host.<tailnet>.ts.net` to tailnet devices only.
+This maps the root path to the loopback service and preserves `/v1/relay`
+for `wss://relay-host.<tailnet>.ts.net/v1/relay`. Tailnet clients need TLS 1.3.
 Do not use `tailscale funnel`; that publishes to the internet. On a Mac the
 CLI is `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
 
@@ -133,7 +159,7 @@ Either way the terminator must pass WebSocket upgrades through (both do by
 default) and must not buffer or idle-timeout long-lived connections below
 the relay's 25 s ping interval.
 
-## 4. Lock down ingress
+## 5. Lock down ingress
 
 - Confirm the relay is on loopback only:
   `sudo lsof -nP -iTCP:8080 -sTCP:LISTEN` shows `127.0.0.1:8080`.
@@ -142,59 +168,44 @@ the relay's 25 s ping interval.
 - Mac mini: no router port-forward to the mini.
 - Tailnet ACL: allow only the paired devices to reach `relay-host:443`.
 
-## 5. Verify
+## 6. Verify
 
-`relaycheck` drives the relay exactly as a device pair would: health probes,
-room minting, WebSocket upgrade for both roles, presence messages, binary
-forwarding both ways and `peer_left`. It validates the certificate against
-the system trust store and has no option to skip that.
-
-On the host, against the plaintext backend:
+Run the authenticated transport probe from a tailnet device through the
+terminator. It checks the selected subprotocol and rejection of a randomly
+generated unenrolled device. The probe uses platform certificate trust.
 
 ```sh
-make check                      # http://127.0.0.1:8080
+go run ./cmd/relaycheck -bridge -require-tls -url "$RELAY_PUBLIC_URL"
 ```
 
-From another tailnet device (a laptop on mobile data is the honest test),
-through the terminator:
-
-```sh
-go run ./cmd/relaycheck -require-tls -url https://relay-host.<tailnet>.ts.net
-```
-
-Expected output ends in `PASS`. Then check the negative cases:
+Expected output ends in `PASS`. For the live connection check, put the real
+Android phone on mobile data with the tailnet active, open the debug **Mac
+mini relay** screen and connect. Check it says **Authenticated to relay**.
+Start the Mac receiver and check its relay status in Settings → Diagnostics.
+`/readyz` should report `"authenticated_sessions":2` while both devices stay
+connected. Endpoint delivery and receipts require the end-to-end upgrade.
 
 | Check | Expected |
 |-------|----------|
-| Same command with Tailscale disconnected | Fails to connect |
+| Authenticated probe with Tailscale disconnected | Fails to connect |
 | `curl http://<public-or-LAN-ip>:8080/healthz` from another machine | Connection refused or timeout |
 | `curl https://<public-ip>/healthz` from outside the tailnet | Connection refused or timeout |
-| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | `{"status":"ok","stats":{...}}` |
-| Stop the service, then run `relaycheck` | Fails; the service manager restarts the relay |
+| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | Healthy status, room/peer counts and authenticated-session count |
+| Remove an enrolled device and reload | That session closes with 4403 |
 
-`/healthz` is the liveness probe and `/readyz` the readiness probe for any
-uptime monitor; both are unauthenticated and reveal only room and peer
-counts.
-
-### What is verified where
-
-Covered by `make test` on every change: defaults and `RELAY_ADDR` handling
-(`internal/config`), and the full wire contract through a TLS-terminating
-reverse proxy with certificate validation (`internal/server`,
-`TestWireContractBehindTLSTerminator`).
-
-Needs a real host, because it depends on your tailnet: certificate issuance
-for the `*.ts.net` name, tailnet-only reachability, ACLs, firewall rules and
-service restart on boot. Section 5 is the checklist for those.
+Run `make check` on the host to smoke-test the legacy room routes through the
+loopback listener. Local TLS integration tests exercise the authenticated
+endpoint with temporary enrollments and keys. The deployed certificate,
+tailnet ACLs and mobile reachability require a live host.
 
 ## Operations
 
 - **Upgrade:** replace the binary and restart the service. On SIGTERM the
   relay closes every connection with `1001 going away` and exits within
-  `RELAY_SHUTDOWN_TIMEOUT`; clients reconnect to the same room. While
-  draining, `/readyz` and new WebSocket upgrades return `503`.
-- **State:** none. Rooms exist only while a peer is connected, so restarts
-  and host moves lose nothing. Moving from the mini to a VPS (or back) is a
-  DNS/hostname change for clients, not a migration.
-- **Logs:** JSON lines on stdout. Room IDs are truncated to eight
-  characters; payloads are never logged.
+  `RELAY_SHUTDOWN_TIMEOUT`. While draining, `/readyz` and new WebSocket
+  upgrades return `503`.
+- **State.** Back up the enrollment file. Sessions and relay queues last
+  only for the life of the process. Update the configured URL on all three
+  if the public hostname changes.
+- **Logs.** The service emits JSON on stdout without packet bodies,
+  signatures, keys, nonces or challenges.

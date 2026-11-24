@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sparshchadha/sparshur-service/internal/bridge"
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
 	"github.com/sparshchadha/sparshur-service/internal/server"
@@ -52,15 +53,27 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	level.Set(l)
 
 	hub := relay.NewHub(log)
+	var authenticated *bridge.Hub
+	if cfg.RelayPublicURL != "" {
+		authenticated, err = bridge.NewHub(bridge.Options{
+			PublicURL: cfg.RelayPublicURL, RelayID: cfg.RelayID, EnrollmentFile: cfg.RelayEnrollmentFile,
+			Origins: cfg.AllowedOrigins, QueueSize: cfg.SendQueueSize, WriteTimeout: cfg.WriteTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("load relay enrollment: %w", err)
+		}
+	}
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(cfg, hub, log).Handler(),
+		Handler:           server.New(cfg, hub, log).WithBridge(authenticated).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stopReload := bridge.WatchEnrollment(ctx, authenticated, log)
+	defer stopReload()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -83,6 +96,14 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// drains those in parallel under the same deadline.
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.Shutdown(shutdownCtx) }()
+	bridgeErr := make(chan error, 1)
+	go func() {
+		if authenticated == nil {
+			bridgeErr <- nil
+			return
+		}
+		bridgeErr <- authenticated.Shutdown(shutdownCtx)
+	}()
 	hubErr := hub.Shutdown(shutdownCtx)
 	if hubErr != nil {
 		hubErr = fmt.Errorf("drain websocket sessions: %w", hubErr)
@@ -94,5 +115,5 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	} else {
 		err = nil
 	}
-	return errors.Join(hubErr, err)
+	return errors.Join(hubErr, err, <-bridgeErr)
 }

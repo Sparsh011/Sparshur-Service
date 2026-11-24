@@ -21,6 +21,14 @@
 		<!-- Loopback only; tailscale serve or Caddy terminates TLS in front. -->
 		<key>RELAY_ADDR</key>
 		<string>127.0.0.1:8080</string>
+		<!-- Enable /v1/relay by setting all three values:
+		<key>RELAY_PUBLIC_URL</key>
+		<string>wss://relay-host.example-tailnet.ts.net/v1/relay</string>
+		<key>RELAY_ID</key>
+		<string>home-mini</string>
+		<key>RELAY_ENROLLMENT_FILE</key>
+		<string>/etc/sparshur-relay/enrollment.json</string>
+		-->
 		<key>RELAY_LOG_LEVEL</key>
 		<string>info</string>
 	</dict>
