@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,26 +24,28 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/sparshchadha/sparshur-service/internal/bridge"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
 )
 
 func main() {
 	base := flag.String("url", "http://127.0.0.1:8080", "relay base URL (http, https, ws or wss)")
 	requireTLS := flag.Bool("require-tls", false, "fail unless the URL is https/wss")
+	bridgeMode := flag.Bool("bridge", false, "check the authenticated relay without enrolling a device")
 	timeout := flag.Duration("timeout", 15*time.Second, "overall deadline")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	if err := run(ctx, *base, *requireTLS); err != nil {
+	if err := run(ctx, *base, *requireTLS, *bridgeMode); err != nil {
 		fmt.Fprintln(os.Stderr, "FAIL:", err)
 		os.Exit(1)
 	}
 	fmt.Println("PASS")
 }
 
-func run(ctx context.Context, base string, requireTLS bool) error {
+func run(ctx context.Context, base string, requireTLS, bridgeMode bool) error {
 	u, err := url.Parse(strings.TrimRight(base, "/"))
 	if err != nil {
 		return err
@@ -56,7 +59,8 @@ func run(ctx context.Context, base string, requireTLS bool) error {
 	default:
 		return fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
-	if u.Host == "" || (u.Path != "" && u.Path != "/") {
+	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/" && (!bridgeMode || u.Path != bridge.Path)) {
 		return errors.New("url must be a bare origin such as https://host[:port]")
 	}
 	u.Path = ""
@@ -74,6 +78,10 @@ func run(ctx context.Context, base string, requireTLS bool) error {
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return errors.New("unexpected redirect")
 	}}
+
+	if bridgeMode {
+		return checkBridge(ctx, client, wsBase)
+	}
 
 	var health struct {
 		Status string `json:"status"`
@@ -216,5 +224,45 @@ func roundTrip(ctx context.Context, from, to *websocket.Conn, payload []byte) er
 	if mt != websocket.MessageBinary || !bytes.Equal(data, payload) {
 		return errors.New("frame was altered in transit")
 	}
+	return nil
+}
+
+func checkBridge(ctx context.Context, client *http.Client, base string) error {
+	conn, _, err := websocket.Dial(ctx, base+bridge.Path, &websocket.DialOptions{
+		HTTPClient: client, Subprotocols: []string{bridge.Subprotocol},
+	})
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow()
+	if conn.Subprotocol() != bridge.Subprotocol {
+		return errors.New("relay subprotocol was not negotiated")
+	}
+	conn.SetReadLimit(bridge.MaxFrame)
+	var id [16]byte
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(id[:]); err != nil {
+		return err
+	}
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	id[6], id[8] = id[6]&0x0f|0x40, id[8]&0x3f|0x80
+	device := fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:])
+	if err := conn.Write(ctx, websocket.MessageBinary, (bridge.Frame{Kind: bridge.Hello, DeviceID: device, Nonce: nonce}).Encode()); err != nil {
+		return err
+	}
+	typ, data, err := conn.Read(ctx)
+	if err != nil {
+		return err
+	}
+	f, err := bridge.Decode(data)
+	if err != nil || typ != websocket.MessageBinary || f.Kind != bridge.AuthRejected {
+		return errors.New("expected AUTH_REJECTED for an unenrolled device")
+	}
+	if _, _, err := conn.Read(ctx); websocket.CloseStatus(err) != 4401 {
+		return errors.New("expected close code 4401 after AUTH_REJECTED")
+	}
+	fmt.Println("ok    /v1/relay negotiated bridge.relay.v1 and rejected an unenrolled device")
 	return nil
 }

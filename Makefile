@@ -5,6 +5,7 @@ run:
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/relay ./cmd/relay
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/relayctl ./cmd/relayctl
 
 test:
 	go test -race -count=1 ./...
@@ -27,6 +28,10 @@ dist:
 	CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build $(DIST_FLAGS) -o dist/relay-linux-arm64  ./cmd/relay
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(DIST_FLAGS) -o dist/relay-darwin-arm64 ./cmd/relay
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(DIST_FLAGS) -o dist/relay-darwin-amd64 ./cmd/relay
+	CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build $(DIST_FLAGS) -o dist/relayctl-linux-amd64  ./cmd/relayctl
+	CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build $(DIST_FLAGS) -o dist/relayctl-linux-arm64  ./cmd/relayctl
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(DIST_FLAGS) -o dist/relayctl-darwin-arm64 ./cmd/relayctl
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(DIST_FLAGS) -o dist/relayctl-darwin-amd64 ./cmd/relayctl
 
 # Smoke-test a running relay end to end, e.g.
 #   make check RELAY_URL=https://relay-host.example-tailnet.ts.net

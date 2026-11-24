@@ -9,20 +9,27 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/sparshchadha/sparshur-service/internal/bridge"
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
 )
 
 // Server wires HTTP routes to the relay hub.
 type Server struct {
-	cfg config.Config
-	hub *relay.Hub
-	log *slog.Logger
+	cfg    config.Config
+	hub    *relay.Hub
+	log    *slog.Logger
+	bridge *bridge.Hub
 }
 
 // New creates a server backed by hub.
 func New(cfg config.Config, hub *relay.Hub, log *slog.Logger) *Server {
 	return &Server{cfg: cfg, hub: hub, log: log}
+}
+
+func (s *Server) WithBridge(h *bridge.Hub) *Server {
+	s.bridge = h
+	return s
 }
 
 // Handler returns the HTTP routes:
@@ -37,6 +44,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("POST /v1/rooms", s.handleCreateRoom)
 	mux.HandleFunc("GET /v1/rooms/{roomID}/ws", s.handleWS)
+	if s.bridge != nil {
+		mux.Handle("GET "+bridge.Path, s.bridge)
+	}
 	return mux
 }
 
@@ -45,11 +55,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	if s.hub.Draining() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining", "stats": s.hub.Stats()})
-		return
+	count, draining := 0, false
+	if s.bridge != nil {
+		count, draining = s.bridge.Status()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "stats": s.hub.Stats()})
+	status, code := "ok", http.StatusOK
+	if draining || s.hub.Draining() {
+		status, code = "draining", http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, map[string]any{
+		"status": status, "stats": s.hub.Stats(), "authenticated_sessions": count,
+	})
 }
 
 func (s *Server) handleCreateRoom(w http.ResponseWriter, _ *http.Request) {

@@ -1,0 +1,14 @@
+{
+  "challenge" : "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=",
+  "client_nonce" : "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+  "device_id" : "33333333-3333-4333-8333-333333333333",
+  "expires_at" : 2000000020,
+  "relay_id" : "mini-test",
+  "relay_url" : "wss://relay.example/v1/relay",
+  "session_id" : "44444444-4444-4444-8444-444444444444",
+  "signature" : "IVKOfDJbuQhBPfXFQJR4az21+iFubF861+wQlt8N0jU4gjRdcRrhO+td8uQPERiNE4p2UCa1DM3lb5O9BFViBg==",
+  "signing_bytes" : "bridge-relay-v1/auth|wss://relay.example/v1/relay|mini-test|33333333-3333-4333-8333-333333333333|44444444-4444-4444-8444-444444444444|VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=|ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=|2000000020",
+  "signing_public_key" : "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA=",
+  "signing_seed" : "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+  "warning" : "PUBLIC TEST KEYS ONLY. No production identities."
+}
