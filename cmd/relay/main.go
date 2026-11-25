@@ -16,6 +16,7 @@ import (
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
 	"github.com/sparshchadha/sparshur-service/internal/server"
+	"github.com/sparshchadha/sparshur-service/internal/transfer"
 )
 
 // logQueueSize bounds buffered log lines; beyond it lines are dropped
@@ -63,9 +64,16 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 			return fmt.Errorf("load relay enrollment: %w", err)
 		}
 	}
+	broker := transfer.New(log, transfer.Options{
+		Wait:        cfg.TransferWait,
+		IdleTimeout: cfg.TransferIdleTimeout,
+		MaxBytes:    cfg.MaxTransferBytes,
+		MaxActive:   cfg.MaxTransfers,
+	})
+	defer broker.Close()
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(cfg, hub, log).WithBridge(authenticated).Handler(),
+		Handler:           server.New(cfg, hub, broker, log).WithBridge(authenticated).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -90,10 +98,10 @@ func run(log *slog.Logger, level *slog.LevelVar) error {
 	// Start the deadline before anything else, logging included.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+	broker.Close()
 	log.Info("shutting down")
-	// srv.Shutdown closes the listener and drains plain HTTP requests, but
-	// neither closes nor waits for hijacked WebSocket connections; the hub
-	// drains those in parallel under the same deadline.
+	// The HTTP server drains paired streaming transfers. Both WebSocket
+	// hubs close their hijacked connections under the same deadline.
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.Shutdown(shutdownCtx) }()
 	bridgeErr := make(chan error, 1)

@@ -12,7 +12,10 @@ relay-host.example-tailnet.ts.net {
 	# Expose the wire contract and nothing else.
 	@relay path /healthz /readyz /v1/rooms /v1/rooms/*
 	handle @relay {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:8080 {
+			# Stream large transfers immediately without response buffering.
+			flush_interval -1
+		}
 	}
 	handle {
 		respond 404

@@ -157,7 +157,11 @@ Linux allow that with `TS_PERMIT_CERT_UID=caddy` in `/etc/default/tailscaled`.
 
 Either way the terminator must pass WebSocket upgrades through (both do by
 default) and must not buffer or idle-timeout long-lived connections below
-the relay's 25 s ping interval.
+the relay's 25 s ping interval. For HTTP file transfers, the proxy must stream
+request and response bodies, disable buffering for both, and impose no
+body-size cap. `tailscale serve` streams bodies directly. Configure any proxy
+I/O timeouts to accommodate the relay's transfer wait and idle settings. The supplied Caddyfile uses
+`flush_interval -1` to flush streamed responses immediately.
 
 ## 5. Lock down ingress
 
@@ -190,22 +194,32 @@ connected. Endpoint delivery and receipts require the end-to-end upgrade.
 | Authenticated probe with Tailscale disconnected | Fails to connect |
 | `curl http://<public-or-LAN-ip>:8080/healthz` from another machine | Connection refused or timeout |
 | `curl https://<public-ip>/healthz` from outside the tailnet | Connection refused or timeout |
-| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | Healthy status, room/peer counts and authenticated-session count |
+| `curl -s https://relay-host.<tailnet>.ts.net/readyz` on the tailnet | Healthy status and counts for rooms, peers, authenticated sessions and active transfers |
 | Remove an enrolled device and reload | That session closes with 4403 |
+| Stop the service | The probe fails while the service is stopped |
 
-Run `make check` on the host to smoke-test the legacy room routes through the
-loopback listener. Local TLS integration tests exercise the authenticated
-endpoint with temporary enrollments and keys. The deployed certificate,
-tailnet ACLs and mobile reachability require a live host.
+Run `make check` on the host to test the room WebSockets and a byte-verified
+1 MiB HTTP transfer through the loopback listener. To exercise the TLS
+terminator, use the host's public TLS origin from an authorized tailnet device.
+
+```sh
+go run ./cmd/relaycheck -require-tls -url https://relay-host.<tailnet>.ts.net
+```
+
+Local tests cover configuration, authenticated sessions, room WebSockets
+behind a TLS terminator and streaming transfers. The deployed certificate,
+tailnet ACLs, service restart on boot and mobile reachability require a live host.
 
 ## Operations
 
 - **Upgrade:** replace the binary and restart the service. On SIGTERM the
   relay closes every connection with `1001 going away` and exits within
-  `RELAY_SHUTDOWN_TIMEOUT`. While draining, `/readyz` and new WebSocket
-  upgrades return `503`.
-- **State.** Back up the enrollment file. Sessions and relay queues last
-  only for the life of the process. Update the configured URL on all three
-  if the public hostname changes.
-- **Logs.** The service emits JSON on stdout without packet bodies,
-  signatures, keys, nonces or challenges.
+  `RELAY_SHUTDOWN_TIMEOUT`. While draining, `/readyz`, new WebSocket upgrades
+  and new transfers return `503`. Waiting transfers wake immediately and
+  paired transfers have the HTTP shutdown grace period to finish.
+- **State.** Back up the enrollment file. Sessions, transfer slots and relay
+  queues last only for the life of the process. Update the configured URL in the
+  relay and both clients if the public hostname changes.
+- **Logs.** The service emits JSON on stdout. Transfer logs include truncated
+  room and transfer IDs, byte counts and duration. Packet and transfer bodies,
+  signatures, keys, nonces and challenges stay out of logs.

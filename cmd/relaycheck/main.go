@@ -1,8 +1,6 @@
-// Command relaycheck smoke-tests a deployed relay from a client's point of
-// view: health probes, room minting, and a full mac/android round trip over
-// the WebSocket endpoint. It talks to the relay exactly as a device would, so
-// it also proves the TLS terminator in front of the relay is trusted and
-// passes WebSocket upgrades through unchanged.
+// Command relaycheck checks room WebSockets and a streaming HTTP transfer.
+// With -bridge, it checks the authenticated WebSocket subprotocol and
+// rejection of an unenrolled device. Both modes use platform TLS trust.
 //
 //	relaycheck -url https://relay.example-tailnet.ts.net
 package main
@@ -95,16 +93,17 @@ func run(ctx context.Context, base string, requireTLS, bridgeMode bool) error {
 	fmt.Println("ok    GET /healthz")
 
 	var ready struct {
-		Status string       `json:"status"`
-		Stats  *relay.Stats `json:"stats"`
+		Status    string       `json:"status"`
+		Stats     *relay.Stats `json:"stats"`
+		Transfers *int         `json:"transfers"`
 	}
 	if err := getJSON(ctx, client, http.MethodGet, httpBase+"/readyz", http.StatusOK, &ready); err != nil {
 		return err
 	}
-	if ready.Status != "ok" || ready.Stats == nil {
-		return fmt.Errorf("/readyz body missing status or stats")
+	if ready.Status != "ok" || ready.Stats == nil || ready.Transfers == nil {
+		return fmt.Errorf("/readyz body missing status, stats or transfers")
 	}
-	fmt.Printf("ok    GET /readyz (rooms=%d peers=%d)\n", ready.Stats.Rooms, ready.Stats.Peers)
+	fmt.Printf("ok    GET /readyz (rooms=%d peers=%d transfers=%d)\n", ready.Stats.Rooms, ready.Stats.Peers, *ready.Transfers)
 
 	var minted struct {
 		RoomID string `json:"room_id"`
@@ -163,7 +162,10 @@ func run(ctx context.Context, base string, requireTLS, bridgeMode bool) error {
 		return fmt.Errorf("mac peer_left: %w", err)
 	}
 	fmt.Println("ok    peer_left on disconnect")
-	return mac.Close(websocket.StatusNormalClosure, "")
+	if err := mac.Close(websocket.StatusNormalClosure, ""); err != nil {
+		return err
+	}
+	return checkTransfer(ctx, client, httpBase, minted.RoomID)
 }
 
 func getJSON(ctx context.Context, client *http.Client, method, target string, want int, out any) error {
@@ -264,5 +266,73 @@ func checkBridge(ctx context.Context, client *http.Client, base string) error {
 		return errors.New("expected close code 4401 after AUTH_REJECTED")
 	}
 	fmt.Println("ok    /v1/relay negotiated bridge.relay.v1 and rejected an unenrolled device")
+	return nil
+}
+
+// checkTransfer verifies the streaming contract through the deployment's proxy.
+func checkTransfer(ctx context.Context, client *http.Client, base, roomID string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	transferID, err := relay.NewRoomID()
+	if err != nil {
+		return err
+	}
+	payload := make([]byte, 1<<20)
+	if _, err := rand.Read(payload); err != nil {
+		return err
+	}
+	target := base + "/v1/rooms/" + roomID + "/transfers/" + transferID
+	get, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	download := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(get)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("status = %d", resp.StatusCode)
+			} else {
+				var got []byte
+				got, err = io.ReadAll(io.LimitReader(resp.Body, int64(len(payload))+1))
+				if err == nil && !bytes.Equal(got, payload) {
+					err = errors.New("body was altered or truncated")
+				}
+			}
+		}
+		download <- err
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	put, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	put.ContentLength = int64(len(payload))
+	put.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := client.Do(put)
+	if err != nil {
+		return fmt.Errorf("transfer PUT: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("transfer PUT status = %d", resp.StatusCode)
+	}
+	var receipt struct {
+		Bytes int64 `json:"bytes"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&receipt); err != nil {
+		return fmt.Errorf("transfer PUT receipt: %w", err)
+	}
+	if receipt.Bytes != int64(len(payload)) {
+		return fmt.Errorf("transfer PUT receipt bytes = %d, want %d", receipt.Bytes, len(payload))
+	}
+	if err := <-download; err != nil {
+		return fmt.Errorf("transfer GET: %w", err)
+	}
+	fmt.Println("ok    streaming transfer PUT/GET (1 MiB)")
 	return nil
 }

@@ -12,19 +12,21 @@ import (
 	"github.com/sparshchadha/sparshur-service/internal/bridge"
 	"github.com/sparshchadha/sparshur-service/internal/config"
 	"github.com/sparshchadha/sparshur-service/internal/relay"
+	"github.com/sparshchadha/sparshur-service/internal/transfer"
 )
 
-// Server wires HTTP routes to the relay hub.
+// Server wires HTTP routes to the relay hub and transfer broker.
 type Server struct {
 	cfg    config.Config
 	hub    *relay.Hub
 	log    *slog.Logger
 	bridge *bridge.Hub
+	broker *transfer.Broker
 }
 
-// New creates a server backed by hub.
-func New(cfg config.Config, hub *relay.Hub, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, hub: hub, log: log}
+// New creates a server backed by hub and broker.
+func New(cfg config.Config, hub *relay.Hub, broker *transfer.Broker, log *slog.Logger) *Server {
+	return &Server{cfg: cfg, hub: hub, broker: broker, log: log}
 }
 
 func (s *Server) WithBridge(h *bridge.Hub) *Server {
@@ -36,14 +38,19 @@ func (s *Server) WithBridge(h *bridge.Hub) *Server {
 //
 //	GET  /healthz                     liveness probe
 //	GET  /readyz                      readiness probe with occupancy stats
+//	GET  /v1/relay                    authenticated WebSocket
 //	POST /v1/rooms                    mint a new random room ID
 //	GET  /v1/rooms/{roomID}/ws?role=  WebSocket relay (role = mac | android)
+//	PUT  /v1/rooms/{roomID}/transfers/{transferID}  streaming upload
+//	GET  /v1/rooms/{roomID}/transfers/{transferID}  streaming download
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("POST /v1/rooms", s.handleCreateRoom)
 	mux.HandleFunc("GET /v1/rooms/{roomID}/ws", s.handleWS)
+	mux.HandleFunc("PUT /v1/rooms/{roomID}/transfers/{transferID}", s.handleTransfer)
+	mux.HandleFunc("GET /v1/rooms/{roomID}/transfers/{transferID}", s.handleTransfer)
 	if s.bridge != nil {
 		mux.Handle("GET "+bridge.Path, s.bridge)
 	}
@@ -64,7 +71,7 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 		status, code = "draining", http.StatusServiceUnavailable
 	}
 	writeJSON(w, code, map[string]any{
-		"status": status, "stats": s.hub.Stats(), "authenticated_sessions": count,
+		"status": status, "stats": s.hub.Stats(), "authenticated_sessions": count, "transfers": s.broker.Active(),
 	})
 }
 
@@ -76,6 +83,25 @@ func (s *Server) handleCreateRoom(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"room_id": id})
+}
+
+func (s *Server) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	roomID, transferID := r.PathValue("roomID"), r.PathValue("transferID")
+	if !relay.ValidRoomID(roomID) || !relay.ValidTransferID(transferID) {
+		w.Header().Set("Connection", "close")
+		writeError(w, http.StatusBadRequest, "invalid room or transfer id")
+		return
+	}
+	if s.hub.Draining() {
+		w.Header().Set("Connection", "close")
+		writeError(w, http.StatusServiceUnavailable, "relay shutting down")
+		return
+	}
+	if r.Method == http.MethodPut {
+		s.broker.Send(w, r, roomID, transferID)
+	} else {
+		s.broker.Receive(w, r, roomID, transferID)
+	}
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {

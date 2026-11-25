@@ -10,6 +10,7 @@ var relayEnv = []string{
 	"RELAY_PING_INTERVAL", "RELAY_WRITE_TIMEOUT", "RELAY_SHUTDOWN_TIMEOUT",
 	"RELAY_ALLOWED_ORIGINS", "RELAY_LOG_LEVEL",
 	"RELAY_PUBLIC_URL", "RELAY_ID", "RELAY_ENROLLMENT_FILE",
+	"RELAY_TRANSFER_WAIT", "RELAY_TRANSFER_IDLE_TIMEOUT", "RELAY_MAX_TRANSFER_BYTES", "RELAY_MAX_TRANSFERS",
 }
 
 func clearEnv(t *testing.T) {
@@ -34,6 +35,11 @@ func TestLoadDeploymentDefaults(t *testing.T) {
 	}
 	if cfg.PingInterval != 25*time.Second || cfg.WriteTimeout != 10*time.Second || cfg.ShutdownTimeout != 15*time.Second {
 		t.Errorf("timers = %v/%v/%v", cfg.PingInterval, cfg.WriteTimeout, cfg.ShutdownTimeout)
+	}
+	if cfg.TransferWait != 60*time.Second || cfg.TransferIdleTimeout != 30*time.Second ||
+		cfg.MaxTransferBytes != 0 || cfg.MaxTransfers != 16 {
+		t.Errorf("transfer defaults = %v/%v/%d/%d, want 60s/30s/0/16",
+			cfg.TransferWait, cfg.TransferIdleTimeout, cfg.MaxTransferBytes, cfg.MaxTransfers)
 	}
 	if len(cfg.AllowedOrigins) != 0 || cfg.LogLevel != "info" {
 		t.Errorf("origins/log level = %v/%q", cfg.AllowedOrigins, cfg.LogLevel)

@@ -7,24 +7,36 @@ import (
 )
 
 func TestLoadDefaults(t *testing.T) {
+	clearEnv(t)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Addr != ":8080" || cfg.MaxMessageBytes != 1<<20 || cfg.SendQueueSize != 64 ||
 		cfg.PingInterval != 25*time.Second || cfg.WriteTimeout != 10*time.Second ||
-		cfg.ShutdownTimeout != 15*time.Second || cfg.LogLevel != "info" || cfg.AllowedOrigins != nil {
+		cfg.ShutdownTimeout != 15*time.Second || cfg.TransferWait != 60*time.Second ||
+		cfg.TransferIdleTimeout != 30*time.Second || cfg.MaxTransferBytes != 0 || cfg.MaxTransfers != 16 ||
+		cfg.LogLevel != "info" || cfg.AllowedOrigins != nil {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
 
 func TestLoadOverrides(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("RELAY_TRANSFER_WAIT", "2m")
+	t.Setenv("RELAY_TRANSFER_IDLE_TIMEOUT", "45s")
+	t.Setenv("RELAY_MAX_TRANSFER_BYTES", "1073741824")
+	t.Setenv("RELAY_MAX_TRANSFERS", "3")
 	t.Setenv("RELAY_SEND_QUEUE_SIZE", "8")
 	t.Setenv("RELAY_PING_INTERVAL", "0")
 	t.Setenv("RELAY_ALLOWED_ORIGINS", " a.example , ,*.b.example")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.TransferWait != 2*time.Minute || cfg.TransferIdleTimeout != 45*time.Second ||
+		cfg.MaxTransferBytes != 1<<30 || cfg.MaxTransfers != 3 {
+		t.Fatalf("unexpected transfer settings: %+v", cfg)
 	}
 	if cfg.SendQueueSize != 8 {
 		t.Fatalf("SendQueueSize = %d", cfg.SendQueueSize)
@@ -39,6 +51,19 @@ func TestLoadOverrides(t *testing.T) {
 
 func TestLoadRejectsInvalid(t *testing.T) {
 	cases := []struct{ key, value string }{
+		{"RELAY_TRANSFER_WAIT", "0"},
+		{"RELAY_TRANSFER_WAIT", "-1s"},
+		{"RELAY_TRANSFER_WAIT", "soon"},
+		{"RELAY_TRANSFER_IDLE_TIMEOUT", "0"},
+		{"RELAY_TRANSFER_IDLE_TIMEOUT", "-1s"},
+		{"RELAY_TRANSFER_IDLE_TIMEOUT", "later"},
+		{"RELAY_MAX_TRANSFER_BYTES", "-1"},
+		{"RELAY_MAX_TRANSFER_BYTES", "many"},
+		{"RELAY_MAX_TRANSFER_BYTES", "9223372036854775808"},
+		{"RELAY_MAX_TRANSFERS", "0"},
+		{"RELAY_MAX_TRANSFERS", "-1"},
+		{"RELAY_MAX_TRANSFERS", "many"},
+		{"RELAY_MAX_TRANSFERS", "9223372036854775808"},
 		{"RELAY_MAX_MESSAGE_BYTES", "0"},
 		{"RELAY_MAX_MESSAGE_BYTES", "-1"},
 		{"RELAY_MAX_MESSAGE_BYTES", "lots"},

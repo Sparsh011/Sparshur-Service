@@ -37,6 +37,18 @@ type Config struct {
 	// they are force-closed.
 	ShutdownTimeout time.Duration
 
+	// TransferWait bounds how long either HTTP transfer side waits for its peer.
+	TransferWait time.Duration
+
+	// TransferIdleTimeout bounds each upload read and download write.
+	TransferIdleTimeout time.Duration
+
+	// MaxTransferBytes caps each transfer. Zero allows unlimited bytes.
+	MaxTransferBytes int64
+
+	// MaxTransfers caps waiting and paired HTTP transfers together.
+	MaxTransfers int
+
 	// AllowedOrigins lists Origin host patterns accepted on WebSocket upgrade.
 	// Native clients (macOS app, Android app) usually send no Origin header,
 	// which is always accepted.
@@ -59,6 +71,9 @@ func Load() (Config, error) {
 		PingInterval:        25 * time.Second,
 		WriteTimeout:        10 * time.Second,
 		ShutdownTimeout:     15 * time.Second,
+		TransferWait:        60 * time.Second,
+		TransferIdleTimeout: 30 * time.Second,
+		MaxTransfers:        16,
 		LogLevel:            getenv("RELAY_LOG_LEVEL", "info"),
 		RelayPublicURL:      os.Getenv("RELAY_PUBLIC_URL"),
 		RelayID:             os.Getenv("RELAY_ID"),
@@ -84,6 +99,20 @@ func Load() (Config, error) {
 	if cfg.ShutdownTimeout, err = durationEnv("RELAY_SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.TransferWait, err = durationEnv("RELAY_TRANSFER_WAIT", cfg.TransferWait); err != nil {
+		return Config{}, err
+	}
+	if cfg.TransferIdleTimeout, err = durationEnv("RELAY_TRANSFER_IDLE_TIMEOUT", cfg.TransferIdleTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxTransferBytes, err = intEnv("RELAY_MAX_TRANSFER_BYTES", cfg.MaxTransferBytes, 64); err != nil {
+		return Config{}, err
+	}
+	transfers, err := intEnv("RELAY_MAX_TRANSFERS", int64(cfg.MaxTransfers), strconv.IntSize)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxTransfers = int(transfers)
 	if v := os.Getenv("RELAY_ALLOWED_ORIGINS"); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
@@ -106,6 +135,18 @@ func Load() (Config, error) {
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("RELAY_SHUTDOWN_TIMEOUT must be positive")
+	}
+	if cfg.TransferWait <= 0 {
+		return Config{}, fmt.Errorf("RELAY_TRANSFER_WAIT must be positive")
+	}
+	if cfg.TransferIdleTimeout <= 0 {
+		return Config{}, fmt.Errorf("RELAY_TRANSFER_IDLE_TIMEOUT must be positive")
+	}
+	if cfg.MaxTransferBytes < 0 {
+		return Config{}, fmt.Errorf("RELAY_MAX_TRANSFER_BYTES must not be negative")
+	}
+	if cfg.MaxTransfers <= 0 {
+		return Config{}, fmt.Errorf("RELAY_MAX_TRANSFERS must be positive")
 	}
 	if err := cfg.validateBridge(); err != nil {
 		return Config{}, err
